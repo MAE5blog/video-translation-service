@@ -166,24 +166,36 @@ class VideoTranslator:
             self.subtitle_max_duration_sec = float(getattr(config, 'subtitle_max_duration_sec', 12.0) or 12.0)
             self.subtitle_chars_per_sec = float(getattr(config, 'subtitle_chars_per_sec', 8.0) or 8.0)
             self.subtitle_linger_slack_sec = float(getattr(config, 'subtitle_linger_slack_sec', 0.5) or 0.5)
+            self.subtitle_linger_trigger_sec = float(getattr(config, 'subtitle_linger_trigger_sec', 6.0) or 6.0)
+            self.subtitle_linger_trigger_ratio = float(getattr(config, 'subtitle_linger_trigger_ratio', 6.0) or 6.0)
+            self.subtitle_linger_keep_ratio = float(getattr(config, 'subtitle_linger_keep_ratio', 4.0) or 4.0)
         else:
             self.subtitle_fix_linger = True
             self.subtitle_min_duration_sec = 1.2
-            self.subtitle_max_duration_sec = 12.0
-            self.subtitle_chars_per_sec = 8.0
-            self.subtitle_linger_slack_sec = 0.5
+            self.subtitle_max_duration_sec = 20.0
+            self.subtitle_chars_per_sec = 5.0
+            self.subtitle_linger_slack_sec = 0.8
+            self.subtitle_linger_trigger_sec = 6.0
+            self.subtitle_linger_trigger_ratio = 6.0
+            self.subtitle_linger_keep_ratio = 4.0
 
         # 参数兜底/保护
         if not (self.subtitle_min_duration_sec > 0):
             self.subtitle_min_duration_sec = 1.2
         if not (self.subtitle_max_duration_sec > 0):
-            self.subtitle_max_duration_sec = 12.0
+            self.subtitle_max_duration_sec = 20.0
         if self.subtitle_max_duration_sec < self.subtitle_min_duration_sec:
             self.subtitle_max_duration_sec = self.subtitle_min_duration_sec
         if not (self.subtitle_chars_per_sec > 0):
-            self.subtitle_chars_per_sec = 8.0
+            self.subtitle_chars_per_sec = 5.0
         if self.subtitle_linger_slack_sec < 0:
             self.subtitle_linger_slack_sec = 0.0
+        if self.subtitle_linger_trigger_sec < 0:
+            self.subtitle_linger_trigger_sec = 0.0
+        if not (self.subtitle_linger_trigger_ratio > 0):
+            self.subtitle_linger_trigger_ratio = 6.0
+        if not (self.subtitle_linger_keep_ratio > 0):
+            self.subtitle_linger_keep_ratio = 4.0
 
         # 线程池用于并发润色
         if self.use_polish:
@@ -1321,6 +1333,9 @@ class VideoTranslator:
         max_dur = float(self.subtitle_max_duration_sec or 12.0)
         cps = float(self.subtitle_chars_per_sec or 8.0)
         slack = float(self.subtitle_linger_slack_sec or 0.5)
+        trigger_sec = float(getattr(self, 'subtitle_linger_trigger_sec', 6.0) or 6.0)
+        trigger_ratio = float(getattr(self, 'subtitle_linger_trigger_ratio', 6.0) or 6.0)
+        keep_ratio = float(getattr(self, 'subtitle_linger_keep_ratio', 4.0) or 4.0)
         if min_dur <= 0:
             min_dur = 1.2
         if max_dur < min_dur:
@@ -1329,6 +1344,12 @@ class VideoTranslator:
             cps = 8.0
         if slack < 0:
             slack = 0.0
+        if trigger_sec < 0:
+            trigger_sec = 0.0
+        if trigger_ratio <= 0:
+            trigger_ratio = 6.0
+        if keep_ratio <= 0:
+            keep_ratio = 4.0
 
         out = []
         total = len(items)
@@ -1349,12 +1370,16 @@ class VideoTranslator:
                 ideal = (char_count / cps) if char_count > 0 else min_dur
                 if ideal < min_dur:
                     ideal = min_dur
-                if ideal > max_dur:
-                    ideal = max_dur
 
                 dur = end - start
-                if dur > ideal + slack:
-                    end = start + ideal
+                # 仅在“明显异常过长”时才收缩：避免正常语速/长句被提前截断
+                if dur >= trigger_sec and dur > (ideal * trigger_ratio + slack):
+                    new_dur = ideal * keep_ratio
+                    if new_dur < min_dur:
+                        new_dur = min_dur
+                    if new_dur > max_dur:
+                        new_dur = max_dur
+                    end = start + new_dur
 
             # 不与下一条重叠（留一点点间隙）
             if idx + 1 < total:

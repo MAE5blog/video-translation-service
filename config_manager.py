@@ -159,17 +159,32 @@ class Config:
     @property
     def subtitle_max_duration_sec(self):
         """字幕最长显示时长（秒），用于避免长静音导致的“字幕滞留”"""
-        return self.get_float('Subtitles', 'max_duration_sec', 12.0)
+        return self.get_float('Subtitles', 'max_duration_sec', 20.0)
 
     @property
     def subtitle_chars_per_sec(self):
         """估算阅读速度：每秒字符数（中文建议 8~12）"""
-        return self.get_float('Subtitles', 'chars_per_sec', 8.0)
+        return self.get_float('Subtitles', 'chars_per_sec', 5.0)
 
     @property
     def subtitle_linger_slack_sec(self):
         """超过“可读时长 + slack”才收缩 end（秒），避免过度干预"""
-        return self.get_float('Subtitles', 'linger_slack_sec', 0.5)
+        return self.get_float('Subtitles', 'linger_slack_sec', 0.8)
+
+    @property
+    def subtitle_linger_trigger_sec(self):
+        """仅当段落时长 >= trigger_sec 才考虑收缩（秒）"""
+        return self.get_float('Subtitles', 'linger_trigger_sec', 6.0)
+
+    @property
+    def subtitle_linger_trigger_ratio(self):
+        """仅当段落时长 > 可读时长 * trigger_ratio 才收缩（更保守，避免提前结束）"""
+        return self.get_float('Subtitles', 'linger_trigger_ratio', 6.0)
+
+    @property
+    def subtitle_linger_keep_ratio(self):
+        """触发收缩后，保留的时长=可读时长*keep_ratio（避免太短）"""
+        return self.get_float('Subtitles', 'linger_keep_ratio', 4.0)
 
     # 音频预处理
     @property
