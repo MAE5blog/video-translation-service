@@ -96,25 +96,16 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
             is_m2m100 = 'm2m100' in translation_name.lower()
             _set_status('translation_downloading', 0.4, f'Downloading translation model {translation_name} ...')
             try:
-                model_kwargs = {}
-                if torch and device == 'cuda':
-                    # 显存优化：直接以 FP16 加载，降低显存占用（更适合 T4 等 16GB 显存环境）
-                    model_kwargs.update({'torch_dtype': torch.float16, 'low_cpu_mem_usage': True})
-
                 if is_m2m100 and M2M100Tokenizer and M2M100ForConditionalGeneration:
                     print(f'[Translation] Using M2M100 model: {translation_name}')
                     TOKENIZER = M2M100Tokenizer.from_pretrained(translation_name, cache_dir='./models/m2m100')
                     _set_status('translation_loading', 0.55, f'Loading translation model {translation_name} ...')
-                    TRANSLATION_MODEL = M2M100ForConditionalGeneration.from_pretrained(
-                        translation_name, cache_dir='./models/m2m100', **model_kwargs
-                    )
+                    TRANSLATION_MODEL = M2M100ForConditionalGeneration.from_pretrained(translation_name, cache_dir='./models/m2m100')
                 elif AutoTokenizer and AutoModelForSeq2SeqLM:
                     print(f'[Translation] Using NLLB model: {translation_name}')
                     TOKENIZER = AutoTokenizer.from_pretrained(translation_name, cache_dir='./models/nllb')
                     _set_status('translation_loading', 0.55, f'Loading translation model {translation_name} ...')
-                    TRANSLATION_MODEL = AutoModelForSeq2SeqLM.from_pretrained(
-                        translation_name, cache_dir='./models/nllb', **model_kwargs
-                    )
+                    TRANSLATION_MODEL = AutoModelForSeq2SeqLM.from_pretrained(translation_name, cache_dir='./models/nllb')
                 else:
                     raise ImportError('No translation library available')
                     
