@@ -13,6 +13,7 @@ import argparse
 import logging
 import threading
 import tempfile
+import re
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -388,13 +389,85 @@ class VideoTranslator:
                 str(input_audio_path)
             ]
             demucs_log_path = Path(tmp_dir) / 'demucs.log'
+            env.setdefault('PYTHONUNBUFFERED', '1')
+
+            percent_re = re.compile(r'(\d{1,3})%')
+            last_percent = None
+            next_log_percent = 10
+            spinner = ['|', '/', '-', '\\']
+            spinner_i = 0
+            start_time = time.time()
+            log_offset = 0
+            log_buf = ''
+
+            def _print_progress(text: str):
+                if not sys.stdout.isatty():
+                    return
+                sys.stdout.write(text)
+                sys.stdout.flush()
+
             with open(demucs_log_path, 'wb') as demucs_log:
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     cmd,
                     env=env,
                     stdout=demucs_log,
                     stderr=subprocess.STDOUT,
                 )
+
+                while True:
+                    rc = proc.poll()
+
+                    # 尝试从 demucs.log 读取新增内容并解析百分比
+                    try:
+                        with open(demucs_log_path, 'rb') as f:
+                            f.seek(log_offset, os.SEEK_SET)
+                            data = f.read()
+                            log_offset = f.tell()
+                        if data:
+                            chunk = data.decode('utf-8', errors='replace')
+                            log_buf = (log_buf + chunk)[-50_000:]  # 仅保留末尾，避免无限增长
+                            matches = percent_re.findall(log_buf)
+                            if matches:
+                                p = int(matches[-1])
+                                if 0 <= p <= 100:
+                                    if last_percent is None:
+                                        last_percent = p
+                                    else:
+                                        # tqdm 可能会有多段进度条，允许在接近完成后重置
+                                        if p < last_percent and last_percent >= 95 and p <= 5:
+                                            last_percent = p
+                                            next_log_percent = 10
+                                        else:
+                                            last_percent = p
+                    except Exception:
+                        pass
+
+                    elapsed = int(time.time() - start_time)
+                    if last_percent is not None:
+                        bar_len = 24
+                        filled = int(bar_len * last_percent / 100)
+                        bar = '#' * filled + '.' * (bar_len - filled)
+                        _print_progress(f"\r    [Demucs] {last_percent:3d}% |{bar}| {elapsed}s")
+
+                        # 记录到日志文件（每10%一次），方便后台查看
+                        if last_percent >= next_log_percent:
+                            logging.info(f"    [Demucs] 进度: {last_percent}%")
+                            next_log_percent += 10
+                    else:
+                        _print_progress(f"\r    [Demucs] {spinner[spinner_i % len(spinner)]} 运行中... {elapsed}s")
+                        spinner_i += 1
+
+                    if rc is not None:
+                        break
+                    time.sleep(0.5)
+
+                proc.wait()
+
+            if sys.stdout.isatty():
+                # 清理进度行
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+
             if proc.returncode != 0:
                 # 避免 stdout PIPE 卡死：输出写入文件，失败时仅打印末尾
                 tail_text = ''
