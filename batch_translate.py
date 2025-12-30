@@ -529,6 +529,19 @@ class VideoTranslator:
                 return response.json()
             else:
                 logging.error(f"\n  × 识别失败: {response.status_code}")
+                # 尽量打印服务端返回的错误信息，方便在无 server.log 的环境排查
+                try:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        err = data.get('error') or data
+                    else:
+                        err = data
+                    logging.error(f"    服务端错误: {err}")
+                except Exception:
+                    body = (response.text or '').strip()
+                    if body:
+                        body = body[:2000]
+                        logging.error(f"    服务端响应: {body}")
                 return None
         except requests.exceptions.Timeout:
             logging.error("\n  × 识别超时（视频太长，超过1小时处理时间）")
