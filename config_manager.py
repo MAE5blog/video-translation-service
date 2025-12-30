@@ -155,6 +155,11 @@ class Config:
         """人声分离设备：auto / cpu / cuda"""
         return self.get('Audio', 'vocal_separation_device', 'auto')
 
+    @property
+    def vocal_separation_chunk_sec(self):
+        """Demucs 分段秒数（用于超长音频避免 OOM；默认 1800=30分钟）"""
+        return self.get_int('Audio', 'vocal_separation_chunk_sec', 1800)
+
 
 # 全局配置实例
 config = Config()

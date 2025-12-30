@@ -105,6 +105,8 @@ use_deepseek_polish = true  # 启用DeepSeek润色
 enable_vocal_separation = false
 vocal_separation_model = htdemucs
 vocal_separation_device = cuda  # 如遇 OOM 可改为 cpu
+# Demucs 分段秒数（仅对超长/超大音频触发；默认 1800=30分钟）
+vocal_separation_chunk_sec = 1800
 # 说明：超长音频会自动分段运行 Demucs，避免一次性加载导致 CPU 内存 OOM（exit code=-9）
 ```
 

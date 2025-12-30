@@ -119,6 +119,7 @@ class VideoTranslator:
     def __init__(self, service_url='http://127.0.0.1:50515', deepseek_key=None,
                  use_polish=False, concurrent_polish=10,
                  enable_vocal_separation=False, vocal_separation_model='htdemucs', vocal_separation_device='auto',
+                 vocal_separation_chunk_sec=1800,
                  clear_cuda_cache_before_tasks=False,
                  asr_chunk_sec=0, asr_chunk_overlap_sec=0.0,
                  manage_models=False, unload_models_after_tasks=False, model_load_timeout=3600):
@@ -141,6 +142,12 @@ class VideoTranslator:
         self.enable_vocal_separation = enable_vocal_separation
         self.vocal_separation_model = vocal_separation_model
         self.vocal_separation_device = (vocal_separation_device or 'auto').lower()
+        try:
+            self.vocal_separation_chunk_sec = int(vocal_separation_chunk_sec)
+        except Exception:
+            self.vocal_separation_chunk_sec = 1800
+        if self.vocal_separation_chunk_sec <= 0:
+            self.vocal_separation_chunk_sec = 1800
         self.clear_cuda_cache_before_tasks = bool(clear_cuda_cache_before_tasks)
         self.asr_chunk_sec = int(asr_chunk_sec or 0)
         self.asr_chunk_overlap_sec = float(asr_chunk_overlap_sec or 0.0)
@@ -651,7 +658,7 @@ class VideoTranslator:
 
         # 触发条件：>1小时 或 >512MB（约 48min 的 44.1kHz/2ch/16bit PCM）
         enable_chunk = True
-        chunk_sec = 600
+        chunk_sec = int(getattr(self, 'vocal_separation_chunk_sec', 1800) or 1800)
         chunk_threshold_sec = 3600
         size_threshold_bytes = 512 * 1024 * 1024
         should_chunk = (
@@ -1615,6 +1622,8 @@ def main():
                         help='Demucs 模型名（默认: 读取config.ini 或 htdemucs）')
     parser.add_argument('--vocal-device', default=None, choices=['auto', 'cpu', 'cuda'],
                         help='人声分离设备：auto/cpu/cuda（默认: 读取config.ini 或 auto）')
+    parser.add_argument('--vocal-chunk-sec', type=int, default=None,
+                        help='Demucs 分段秒数（仅超长/超大音频触发；默认读取config.ini；默认1800）')
     parser.add_argument('--cuda-clear', dest='cuda_clear', action='store_true', default=None,
                         help='在GPU重任务前清理CUDA缓存（降低OOM概率，略慢）')
     parser.add_argument('--no-cuda-clear', dest='cuda_clear', action='store_false',
@@ -1689,6 +1698,14 @@ def main():
     if not vocal_separation_device:
         vocal_separation_device = 'auto'
 
+    # Demucs 分段秒数（命令行 > config.ini > 1800）
+    if args.vocal_chunk_sec is None:
+        vocal_separation_chunk_sec = config.vocal_separation_chunk_sec if CONFIG_AVAILABLE else 1800
+    else:
+        vocal_separation_chunk_sec = int(args.vocal_chunk_sec)
+    if vocal_separation_chunk_sec <= 0:
+        vocal_separation_chunk_sec = 1800
+
     # 是否在 GPU 重任务前清理 CUDA 缓存（命令行 > config.ini）
     if args.cuda_clear is None:
         clear_cuda_cache_before_tasks = config.clear_cuda_cache_before_tasks if CONFIG_AVAILABLE else False
@@ -1734,6 +1751,7 @@ def main():
         enable_vocal_separation=enable_vocal_separation,
         vocal_separation_model=vocal_separation_model,
         vocal_separation_device=vocal_separation_device,
+        vocal_separation_chunk_sec=vocal_separation_chunk_sec,
         clear_cuda_cache_before_tasks=clear_cuda_cache_before_tasks,
         asr_chunk_sec=asr_chunk_sec,
         asr_chunk_overlap_sec=asr_chunk_overlap_sec,
