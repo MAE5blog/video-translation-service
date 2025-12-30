@@ -3,8 +3,10 @@ import io
 import time
 import sys
 import threading
+import traceback
 from contextlib import nullcontext as _nullcontext
 from flask import Flask, request, jsonify
+from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
 from typing import Optional
 
@@ -35,6 +37,36 @@ MODEL_LOCK = threading.Lock()
 ASR_MODEL = None
 TRANSLATION_MODEL = None
 TOKENIZER = None
+
+
+def _want_traceback() -> bool:
+    v = os.environ.get('VTS_RETURN_TRACEBACK') or os.environ.get('RETURN_TRACEBACK') or ''
+    return v.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+@app.errorhandler(Exception)
+def handle_unhandled_exception(e):
+    """保证返回 JSON，避免客户端只看到 HTML 500 页面。"""
+    if isinstance(e, HTTPException):
+        payload = {
+            'success': False,
+            'error': e.description,
+            'type': type(e).__name__,
+            'code': e.code,
+        }
+        if _want_traceback():
+            payload['traceback'] = traceback.format_exc()[-8000:]
+        return jsonify(payload), e.code
+
+    payload = {
+        'success': False,
+        'error': str(e),
+        'type': type(e).__name__,
+        'code': 500,
+    }
+    if _want_traceback():
+        payload['traceback'] = traceback.format_exc()[-8000:]
+    return jsonify(payload), 500
 
 
 def _torch_cuda_available() -> bool:
@@ -219,11 +251,11 @@ def transcribe():
     ext = os.path.splitext(secure_filename(f.filename or 'audio.bin'))[1]
     filename = f"{uuid.uuid4().hex}{ext}"
     path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    f.save(path)
     
     language = request.form.get('language')  # optional
     started = time.time()
     try:
+        f.save(path)
         # 如果是PCM，转换为WAV
         if filename.endswith('.pcm') or filename.endswith('.raw'):
             import wave
@@ -256,7 +288,6 @@ def transcribe():
     except Exception as e:
         if os.path.exists(path):
             os.remove(path)
-        import traceback
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
