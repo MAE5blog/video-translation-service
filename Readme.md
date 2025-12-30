@@ -86,6 +86,10 @@ beam_size = 3
 clear_cuda_cache_before_tasks = true
 
 [ASR]
+# 可选：指定音频语言（auto=自动检测；填错会变差）
+# 备选示例：auto / en / zh / ja / ko / de / fr / es / ru / ar
+language = auto
+
 # 可选：分块识别（显示进度条/降低长音频500/OOM；0=禁用）
 chunk_sec = 300
 chunk_overlap_sec = 0.5

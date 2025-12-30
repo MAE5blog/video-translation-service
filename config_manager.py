@@ -116,6 +116,11 @@ class Config:
 
     # ASR 运行配置
     @property
+    def asr_language(self):
+        """指定 ASR 音频语言（auto=自动检测）"""
+        return self.get('ASR', 'language', 'auto')
+
+    @property
     def asr_chunk_sec(self):
         """ASR 分块秒数（0=禁用）"""
         return self.get_int('ASR', 'chunk_sec', 0)
@@ -167,6 +172,7 @@ if __name__ == '__main__':
     print(f"使用GPU: {config.use_gpu}")
     print(f"beam_size: {config.beam_size}")
     print(f"GPU任务前清理显存缓存: {config.clear_cuda_cache_before_tasks}")
+    print(f"ASR语言: {config.asr_language}")
     print(f"ASR分块秒数: {config.asr_chunk_sec}")
     print(f"ASR分块重叠秒数: {config.asr_chunk_overlap_sec}")
     print(f"默认目标语言: {config.default_target_language}")

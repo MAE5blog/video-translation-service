@@ -1455,7 +1455,7 @@ def main():
 
     parser.add_argument('input', help='视频文件或目录路径')
     parser.add_argument('-t', '--target', default='zh', help='目标语言（默认: zh）')
-    parser.add_argument('-s', '--source', default='auto', help='源语言（默认: auto自动检测）')
+    parser.add_argument('-s', '--source', default=None, help='源语言/ASR语言（默认: 读取config.ini；未配置则auto自动检测）')
     parser.add_argument('-o', '--output', help='输出目录（默认: 与视频同目录）')
     parser.add_argument('--translation-only', action='store_true', help='仅生成译文字幕（不含原文）')
     parser.add_argument('--recursive', '-r', action='store_true', help='递归处理子目录')
@@ -1517,6 +1517,14 @@ def main():
     use_polish = args.polish
     if not use_polish and CONFIG_AVAILABLE:
         use_polish = config.use_deepseek_polish
+
+    # 源语言（命令行 > config.ini > auto）
+    if args.source:
+        source_lang = args.source
+    elif CONFIG_AVAILABLE:
+        source_lang = getattr(config, 'asr_language', None) or 'auto'
+    else:
+        source_lang = 'auto'
 
     # 确定是否启用人声分离（命令行 > config.ini）
     if args.vocal_separation is None:
@@ -1659,7 +1667,7 @@ def main():
             translator.translate_video(
                 input_path,
                 args.target,
-                args.source,
+                source_lang,
                 args.translation_only,
                 args.output
             )
@@ -1671,7 +1679,7 @@ def main():
             translator.translate_directory(
                 input_path,
                 args.target,
-                args.source,
+                source_lang,
                 args.translation_only,
                 args.recursive,
                 args.output
