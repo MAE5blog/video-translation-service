@@ -119,7 +119,8 @@ class VideoTranslator:
     def __init__(self, service_url='http://127.0.0.1:50515', deepseek_key=None,
                  use_polish=False, concurrent_polish=10,
                  enable_vocal_separation=False, vocal_separation_model='htdemucs', vocal_separation_device='auto',
-                 clear_cuda_cache_before_tasks=False):
+                 clear_cuda_cache_before_tasks=False,
+                 asr_chunk_sec=0, asr_chunk_overlap_sec=0.0):
         self.service_url = service_url
 
         # 优先级：命令行参数 > 环境变量 > config.ini
@@ -140,6 +141,8 @@ class VideoTranslator:
         self.vocal_separation_model = vocal_separation_model
         self.vocal_separation_device = (vocal_separation_device or 'auto').lower()
         self.clear_cuda_cache_before_tasks = bool(clear_cuda_cache_before_tasks)
+        self.asr_chunk_sec = int(asr_chunk_sec or 0)
+        self.asr_chunk_overlap_sec = float(asr_chunk_overlap_sec or 0.0)
 
         # 线程池用于并发润色
         if self.use_polish:
@@ -514,41 +517,254 @@ class VideoTranslator:
             else:
                 logging.error(f"  ! Demucs 临时目录已保留用于排查: {tmp_dir}")
 
-    def transcribe(self, audio_path):
-        """语音识别"""
+    @staticmethod
+    def _trim_text_overlap(prev_text: str, text: str, max_words: int = 12) -> str:
+        """
+        处理分块识别时的边界重复：若上一段尾部若干单词与本段开头重复，则从本段移除该重复部分。
+        """
+        prev_text = (prev_text or '').strip()
+        text = (text or '').strip()
+        if not prev_text or not text:
+            return text
+
+        prev_words = prev_text.split()
+        words = text.split()
+        if not prev_words or not words:
+            return text
+
+        def _norm_word(w: str) -> str:
+            return re.sub(r'^[\\W_]+|[\\W_]+$', '', w).lower()
+
+        prev_norm = [_norm_word(w) for w in prev_words]
+        norm = [_norm_word(w) for w in words]
+        max_k = min(max_words, len(prev_norm), len(norm))
+        for k in range(max_k, 0, -1):
+            if prev_norm[-k:] == norm[:k] and all(prev_norm[-k:]) and all(norm[:k]):
+                return " ".join(words[k:]).lstrip()
+        return text
+
+    def _transcribe_http(self, audio_file, filename: str, language: str | None, timeout: int = 3600):
+        """调用服务端 /transcribe（audio_file 为文件对象或 BytesIO）。"""
+        files = {'audio': (filename, audio_file)}
+        data = {}
+        if language and language != 'auto':
+            data['language'] = language
+
+        response = requests.post(
+            f"{self.service_url}/transcribe",
+            files=files,
+            data=data,
+            timeout=timeout
+        )
+
+        if response.status_code == 200:
+            return response.json()
+
+        logging.error(f"\n  × 识别失败: {response.status_code}")
+        # 尽量打印服务端返回的错误信息，方便在无 server.log 的环境排查
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                err = data.get('error') or data
+            else:
+                err = data
+            logging.error(f"    服务端错误: {err}")
+            if isinstance(data, dict) and data.get('traceback'):
+                logging.error("    服务端 traceback（末尾）：\n" + str(data.get('traceback'))[-2000:])
+        except Exception:
+            body = (response.text or '').strip()
+            if body:
+                body = body[:2000]
+                logging.error(f"    服务端响应: {body}")
+        return None
+
+    def transcribe_single(self, audio_path: str, language: str | None = None):
+        """语音识别（整段，阻塞等待服务端返回）。"""
         try:
             with open(audio_path, 'rb') as f:
-                files = {'audio': f}
-                response = requests.post(
-                    f"{self.service_url}/transcribe",
-                    files=files,
-                    timeout=3600
-                )
-
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logging.error(f"\n  × 识别失败: {response.status_code}")
-                # 尽量打印服务端返回的错误信息，方便在无 server.log 的环境排查
-                try:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        err = data.get('error') or data
-                    else:
-                        err = data
-                    logging.error(f"    服务端错误: {err}")
-                except Exception:
-                    body = (response.text or '').strip()
-                    if body:
-                        body = body[:2000]
-                        logging.error(f"    服务端响应: {body}")
-                return None
+                return self._transcribe_http(f, Path(audio_path).name, language, timeout=3600)
         except requests.exceptions.Timeout:
             logging.error("\n  × 识别超时（视频太长，超过1小时处理时间）")
             return None
         except Exception as e:
             logging.error(f"\n  × 识别错误: {e}")
             return None
+
+    def transcribe_chunked(self, audio_path: str, chunk_sec: int, overlap_sec: float = 0.0, language: str | None = None):
+        """语音识别（分块上传，显示进度；也可降低长音频导致的 500/OOM 概率）。"""
+        import io
+        import math
+        import wave
+
+        try:
+            chunk_sec = int(chunk_sec)
+            overlap_sec = float(overlap_sec or 0.0)
+        except Exception:
+            return self.transcribe_single(audio_path, language=language)
+
+        if chunk_sec <= 0:
+            return self.transcribe_single(audio_path, language=language)
+        if overlap_sec < 0:
+            overlap_sec = 0.0
+        if overlap_sec >= chunk_sec:
+            overlap_sec = max(0.0, chunk_sec - 0.1)
+
+        try:
+            with wave.open(audio_path, 'rb') as wf:
+                nchannels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                nframes = wf.getnframes()
+
+                if framerate <= 0 or nframes <= 0:
+                    return self.transcribe_single(audio_path, language=language)
+
+                total_sec = nframes / float(framerate)
+                chunk_frames = max(1, int(chunk_sec * framerate))
+                overlap_frames = max(0, int(overlap_sec * framerate))
+                step_frames = max(1, chunk_frames - overlap_frames)
+
+                if nframes <= chunk_frames:
+                    return self.transcribe_single(audio_path, language=language)
+
+                total_chunks = int(math.ceil((nframes - chunk_frames) / step_frames)) + 1
+
+                is_tty = sys.stdout.isatty()
+                bar_len = 24
+                start_time = time.time()
+                last_percent = -1
+
+                def _print_progress(text: str):
+                    if not is_tty:
+                        return
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
+
+                merged_segments: list[dict] = []
+                merged_text = ''
+                detected_language = None
+                detected_prob = None
+                total_processing_ms = 0
+
+                start_frame = 0
+                chunk_index = 0
+                while start_frame < nframes:
+                    end_frame = min(nframes, start_frame + chunk_frames)
+                    chunk_start_sec = start_frame / float(framerate)
+                    chunk_end_sec = end_frame / float(framerate)
+
+                    chunk_index += 1
+
+                    wf.setpos(start_frame)
+                    frames = wf.readframes(end_frame - start_frame)
+                    bio = io.BytesIO()
+                    with wave.open(bio, 'wb') as out_wav:
+                        out_wav.setnchannels(nchannels)
+                        out_wav.setsampwidth(sampwidth)
+                        out_wav.setframerate(framerate)
+                        out_wav.writeframes(frames)
+                    bio.seek(0)
+
+                    lang_to_use = None
+                    if language and language != 'auto':
+                        lang_to_use = language
+                    elif detected_language:
+                        lang_to_use = detected_language
+
+                    result = self._transcribe_http(
+                        bio,
+                        filename=f"chunk_{chunk_index}.wav",
+                        language=lang_to_use,
+                        timeout=3600
+                    )
+                    if not result or not result.get('success'):
+                        if is_tty:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
+                        return None
+
+                    if detected_language is None:
+                        detected_language = result.get('language')
+                        detected_prob = result.get('language_probability')
+                    try:
+                        total_processing_ms += int(result.get('processing_time_ms') or 0)
+                    except Exception:
+                        pass
+
+                    for seg in result.get('segments', []) or []:
+                        try:
+                            seg_start = float(seg.get('start', 0.0)) + chunk_start_sec
+                            seg_end = float(seg.get('end', 0.0)) + chunk_start_sec
+                        except Exception:
+                            continue
+                        seg_text_raw = seg.get('text', '')
+                        if not str(seg_text_raw).strip():
+                            continue
+
+                        if merged_segments:
+                            last = merged_segments[-1]
+                            last_end = float(last.get('end', 0.0))
+                            if seg_end <= last_end + 0.02:
+                                continue
+                            if seg_start < last_end - 0.02:
+                                trimmed = self._trim_text_overlap(last.get('text', ''), str(seg_text_raw))
+                                if trimmed and trimmed != str(seg_text_raw).strip():
+                                    seg_text_raw = trimmed
+                                seg_start = max(seg_start, last_end)
+
+                        if seg_end <= seg_start + 0.02:
+                            continue
+
+                        merged_segments.append({'start': seg_start, 'end': seg_end, 'text': seg_text_raw})
+                        try:
+                            merged_text += str(seg_text_raw)
+                        except Exception:
+                            pass
+
+                    elapsed = int(time.time() - start_time)
+                    percent = int(min(100.0, (chunk_end_sec / total_sec) * 100.0))
+                    if is_tty and percent != last_percent:
+                        filled = int(bar_len * percent / 100)
+                        bar = '#' * filled + '.' * (bar_len - filled)
+                        _print_progress(f"\r    [ASR] {percent:3d}% |{bar}| {elapsed}s (chunk {chunk_index}/{total_chunks})")
+                        last_percent = percent
+                    elif not is_tty:
+                        filled = int(bar_len * percent / 100)
+                        bar = '#' * filled + '.' * (bar_len - filled)
+                        logging.info(f"    [ASR] {percent:3d}% |{bar}| {elapsed}s (chunk {chunk_index}/{total_chunks})")
+
+                    if end_frame >= nframes:
+                        break
+                    start_frame += step_frames
+
+                if is_tty:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+                return {
+                    'success': True,
+                    'text': (merged_text or '').strip(),
+                    'language': detected_language,
+                    'language_probability': detected_prob,
+                    'segments': merged_segments,
+                    'processing_time_ms': total_processing_ms,
+                }
+        except wave.Error:
+            return self.transcribe_single(audio_path, language=language)
+        except Exception as e:
+            logging.error(f"\n  × 分块识别错误: {e}")
+            return self.transcribe_single(audio_path, language=language)
+
+    def transcribe(self, audio_path: str, language: str | None = None):
+        """语音识别（支持分块进度条）。"""
+        if self.asr_chunk_sec and self.asr_chunk_sec > 0:
+            return self.transcribe_chunked(
+                audio_path,
+                chunk_sec=self.asr_chunk_sec,
+                overlap_sec=self.asr_chunk_overlap_sec,
+                language=language
+            )
+        return self.transcribe_single(audio_path, language=language)
 
     def translate_text(self, text, source_lang='en', target_lang='zh', max_retries=3):
         """翻译文本（带重试）"""
@@ -878,7 +1094,8 @@ class VideoTranslator:
             self.clear_cuda_cache('before_asr')
             logging.info(f"  [{step}/{total_steps}] 语音识别（长视频可能需要数分钟）...")
             transcribe_start = time.time()
-            result = self.transcribe(str(asr_audio_path))
+            asr_language = None if source_lang == 'auto' else source_lang
+            result = self.transcribe(str(asr_audio_path), language=asr_language)
 
             # 删除临时音频
             for temp_path in temp_files:
@@ -1145,6 +1362,10 @@ def main():
                         help='在GPU重任务前清理CUDA缓存（降低OOM概率，略慢）')
     parser.add_argument('--no-cuda-clear', dest='cuda_clear', action='store_false',
                         help='禁用GPU任务前清理CUDA缓存')
+    parser.add_argument('--asr-chunk-sec', type=int, default=None,
+                        help='ASR 分块秒数（启用进度条/降低长音频500/OOM；0=禁用；默认读取config.ini）')
+    parser.add_argument('--asr-overlap-sec', type=float, default=None,
+                        help='ASR 分块重叠秒数（避免切在单词中间；默认读取config.ini）')
     parser.add_argument('--wait-ready', action='store_true',
                         help='等待翻译服务就绪（首次下载/加载模型可能需要较长时间）')
     parser.add_argument('--wait-timeout', type=int, default=3600,
@@ -1199,6 +1420,17 @@ def main():
     else:
         clear_cuda_cache_before_tasks = bool(args.cuda_clear)
 
+    # ASR 分块（命令行 > config.ini）
+    if args.asr_chunk_sec is None:
+        asr_chunk_sec = config.asr_chunk_sec if CONFIG_AVAILABLE else 0
+    else:
+        asr_chunk_sec = int(args.asr_chunk_sec)
+
+    if args.asr_overlap_sec is None:
+        asr_chunk_overlap_sec = config.asr_chunk_overlap_sec if CONFIG_AVAILABLE else 0.0
+    else:
+        asr_chunk_overlap_sec = float(args.asr_overlap_sec)
+
     # 创建翻译器
     translator = VideoTranslator(
         service_url=args.service_url,
@@ -1208,7 +1440,9 @@ def main():
         enable_vocal_separation=enable_vocal_separation,
         vocal_separation_model=vocal_separation_model,
         vocal_separation_device=vocal_separation_device,
-        clear_cuda_cache_before_tasks=clear_cuda_cache_before_tasks
+        clear_cuda_cache_before_tasks=clear_cuda_cache_before_tasks,
+        asr_chunk_sec=asr_chunk_sec,
+        asr_chunk_overlap_sec=asr_chunk_overlap_sec
     )
 
     # 处理进度命令

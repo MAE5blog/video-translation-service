@@ -77,6 +77,11 @@ beam_size = 3
 # 可选：在 GPU 重任务前清理 CUDA 缓存（降低 OOM 概率，略慢）
 clear_cuda_cache_before_tasks = true
 
+[ASR]
+# 可选：分块识别（显示进度条/降低长音频500/OOM；0=禁用）
+chunk_sec = 300
+chunk_overlap_sec = 0.5
+
 [Translation]
 default_target_language = zh
 use_deepseek_polish = true  # 启用DeepSeek润色
