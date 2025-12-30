@@ -35,6 +35,13 @@ ASR_MODEL = None
 TRANSLATION_MODEL = None
 TOKENIZER = None
 
+
+def _torch_cuda_available() -> bool:
+    try:
+        return bool(torch and torch.cuda.is_available())
+    except Exception:
+        return False
+
 # Readiness booleans kept for backward compatibility
 ASR_READY = False
 TRANSLATION_READY = False
@@ -140,7 +147,8 @@ def init_models():
     payload = request.json or {}
     asr_size = payload.get('asr_model_size', 'medium')
     translation_name = payload.get('translation_model', 'facebook/nllb-200-distilled-600M')
-    device = 'cuda' if payload.get('use_gpu', True) else 'cpu'
+    want_gpu = payload.get('use_gpu', True)
+    device = 'cuda' if want_gpu and _torch_cuda_available() else 'cpu'
     compute_type = payload.get('compute_type', 'float16' if device == 'cuda' else 'int8')
 
     # If already ready return immediately
@@ -387,21 +395,47 @@ def process():
 
 if __name__ == '__main__':
     import argparse
+
+    # Optional config.ini support (keeps CLI args as highest priority)
+    try:
+        from config_manager import config as app_config  # type: ignore
+    except Exception:
+        app_config = None
+
+    default_host = getattr(app_config, 'service_host', '127.0.0.1')
+    default_port = getattr(app_config, 'service_port', 50515)
+    default_asr_model_size = getattr(app_config, 'asr_model_size', 'medium')
+    default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-distilled-1.3B')
+    default_use_gpu = getattr(app_config, 'use_gpu', True)
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', default=50515, type=int)
-    parser.add_argument('--asr_model_size', default='medium')
-    parser.add_argument('--translation_model', default='facebook/nllb-200-distilled-1.3B')  # 升级到1.3B（BLEU +8-10分）
-    parser.add_argument('--no_gpu', action='store_true')
+    parser.add_argument('--host', default=default_host)
+    parser.add_argument('--port', default=default_port, type=int)
+    parser.add_argument('--asr_model_size', default=default_asr_model_size)
+    parser.add_argument('--translation_model', default=default_translation_model)  # 升级到1.3B（BLEU +8-10分）
+    parser.add_argument('--no_gpu', action='store_true', help='强制使用CPU（忽略config.ini与CUDA检测）')
     args = parser.parse_args()
     print('[PythonService] Starting with config:', args)
     print('[PythonService] HuggingFace endpoint:', os.environ.get('HF_ENDPOINT') or 'default')
     sys.stdout.flush()
     
     # 🔥 启动后自动加载模型
-    device = 'cpu' if args.no_gpu else 'cuda'
-    compute_type = 'int8' if args.no_gpu else 'float16'
+    if args.no_gpu:
+        device = 'cpu'
+        device_reason = '--no_gpu'
+    elif not default_use_gpu:
+        device = 'cpu'
+        device_reason = 'config.ini use_gpu=false'
+    elif _torch_cuda_available():
+        device = 'cuda'
+        device_reason = 'CUDA available'
+    else:
+        device = 'cpu'
+        device_reason = 'CUDA not available'
+
+    compute_type = 'float16' if device == 'cuda' else 'int8'
     print(f'[PythonService] Auto-loading models: ASR={args.asr_model_size}, Translation={args.translation_model}, Device={device}')
+    print(f'[PythonService] Device selection reason: {device_reason}')
     sys.stdout.flush()
     
     import threading

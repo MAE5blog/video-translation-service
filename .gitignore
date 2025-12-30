@@ -47,6 +47,7 @@ logs/
 config.ini
 .env
 secrets.py
+server.pid
 
 # 测试文件
 test_*.py

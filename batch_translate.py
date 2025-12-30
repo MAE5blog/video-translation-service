@@ -12,6 +12,7 @@ import json
 import argparse
 import logging
 import threading
+import tempfile
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -114,7 +115,8 @@ class VideoTranslator:
     """视频批量翻译器（支持并发润色）"""
 
     def __init__(self, service_url='http://127.0.0.1:50515', deepseek_key=None,
-                 use_polish=False, concurrent_polish=10):
+                 use_polish=False, concurrent_polish=10,
+                 enable_vocal_separation=False, vocal_separation_model='htdemucs', vocal_separation_device='auto'):
         self.service_url = service_url
 
         # 优先级：命令行参数 > 环境变量 > config.ini
@@ -129,6 +131,11 @@ class VideoTranslator:
 
         self.use_polish = use_polish and self.deepseek_key
         self.concurrent_polish = concurrent_polish  # 并发数
+
+        # 可选：人声分离（Demucs）用于提升嘈杂/背景音乐场景识别效果
+        self.enable_vocal_separation = enable_vocal_separation
+        self.vocal_separation_model = vocal_separation_model
+        self.vocal_separation_device = (vocal_separation_device or 'auto').lower()
 
         # 线程池用于并发润色
         if self.use_polish:
@@ -219,33 +226,72 @@ class VideoTranslator:
 
         return False, None
 
-    def check_service(self):
-        """检查翻译服务是否可用"""
-        try:
-            response = requests.get(f"{self.service_url}/health", timeout=5)
-            if response.status_code == 200:
+    def check_service(self, wait_ready=False, wait_timeout=3600, poll_interval=2):
+        """检查翻译服务是否可用（可选等待服务就绪）"""
+        start_time = time.time()
+        last_status = None
+        last_log_time = 0.0
+        last_error_log_time = 0.0
+
+        while True:
+            try:
+                response = requests.get(f"{self.service_url}/health", timeout=5)
+                if response.status_code != 200:
+                    logging.error(f"× 翻译服务异常: {response.status_code}")
+                    return False
+
                 data = response.json()
+
                 if data.get('ready'):
                     logging.info("✓ 翻译服务正常运行")
                     return True
-                else:
+
+                if not wait_ready:
                     logging.error("× 翻译服务未就绪，请等待模型加载")
                     return False
-            else:
-                logging.error(f"× 翻译服务异常: {response.status_code}")
-                return False
-        except Exception as e:
-            logging.error(f"× 无法连接到翻译服务: {e}")
-            logging.error(f"  请确保服务正在运行: python server_optimized.py")
-            return False
 
-    def extract_audio(self, video_path, output_path):
+                phase = data.get('phase')
+                progress = data.get('progress')
+                message = data.get('message')
+                error = data.get('error')
+
+                # 仅在状态变化时输出，避免刷屏
+                status = (phase, progress, message, error)
+                now = time.time()
+                if status != last_status or (now - last_log_time) >= 10:
+                    pct = int((progress or 0) * 100)
+                    logging.info(f"… 等待服务就绪: {phase} ({pct}%) {message or ''}".rstrip())
+                    last_status = status
+                    last_log_time = now
+
+                if phase == 'error':
+                    logging.error(f"× 模型加载失败: {error or '未知错误'}")
+                    return False
+
+            except Exception as e:
+                if not wait_ready:
+                    logging.error(f"× 无法连接到翻译服务: {e}")
+                    logging.error("  请确保服务正在运行: python server_optimized.py")
+                    return False
+                now = time.time()
+                if (now - last_error_log_time) >= 10:
+                    logging.info(f"… 等待翻译服务启动: {e}")
+                    last_error_log_time = now
+
+            if time.time() - start_time > wait_timeout:
+                logging.error(f"× 等待翻译服务就绪超时（{wait_timeout}秒）")
+                logging.error("  你可以：1) 继续等待并重试 2) 查看 server.log 3) 换更小的翻译模型")
+                return False
+
+            time.sleep(poll_interval)
+
+    def extract_audio(self, video_path, output_path, sample_rate=16000, channels=1):
         """从视频提取音频"""
         try:
             cmd = [
                 'ffmpeg', '-i', video_path,
                 '-vn', '-acodec', 'pcm_s16le',
-                '-ar', '16000', '-ac', '1',
+                '-ar', str(sample_rate), '-ac', str(channels),
                 '-y', output_path
             ]
 
@@ -262,6 +308,51 @@ class VideoTranslator:
         except FileNotFoundError:
             logging.error("  × 找不到ffmpeg，请安装ffmpeg并添加到PATH")
             return False
+
+    def separate_vocals(self, input_audio_path: Path, output_wav_path: Path):
+        """
+        使用 Demucs 做人声分离，输出 16kHz/mono WAV 供 ASR 使用。
+
+        需要额外安装：
+          pip install demucs
+        """
+        try:
+            import demucs  # noqa: F401
+        except Exception as e:
+            raise RuntimeError("已启用人声分离，但未安装 demucs：请先运行 `pip install demucs`") from e
+
+        # 通过环境变量控制 Demucs 是否使用 GPU（避免依赖不同版本的 CLI 参数）
+        env = os.environ.copy()
+        if self.vocal_separation_device == 'cpu':
+            env['CUDA_VISIBLE_DEVICES'] = ''
+
+        with tempfile.TemporaryDirectory(prefix='demucs_') as tmp_dir:
+            cmd = [
+                sys.executable, '-m', 'demucs.separate',
+                '-n', self.vocal_separation_model,
+                '--two-stems', 'vocals',
+                '-o', tmp_dir,
+                str(input_audio_path)
+            ]
+            subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            tmp_dir_path = Path(tmp_dir)
+            candidates = list(tmp_dir_path.rglob('vocals.wav'))
+            if not candidates:
+                candidates = [p for p in tmp_dir_path.rglob('vocals.*') if p.is_file()]
+            if not candidates:
+                raise FileNotFoundError(f"Demucs 输出未找到：{tmp_dir}")
+
+            vocals_path = candidates[0]
+            cmd = [
+                'ffmpeg', '-i', str(vocals_path),
+                '-vn', '-acodec', 'pcm_s16le',
+                '-ar', '16000', '-ac', '1',
+                '-y', str(output_wav_path)
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not output_wav_path.exists():
+                raise FileNotFoundError(f"人声分离输出未生成: {output_wav_path}")
 
     def transcribe(self, audio_path):
         """语音识别"""
@@ -430,12 +521,15 @@ class VideoTranslator:
                     return translated
         return translated
 
-    def polish_batch_with_context(self, segments, source_lang, target_lang):
+    def polish_batch_with_context(self, segments, source_lang, target_lang, step_idx=None, step_total=None):
         """批量并发润色（带上下文）"""
         if not self.use_polish:
             return
 
-        logging.info(f"  [4/5] DeepSeek并发润色（{self.concurrent_polish}线程）...")
+        if step_idx and step_total:
+            logging.info(f"  [{step_idx}/{step_total}] DeepSeek并发润色（{self.concurrent_polish}线程）...")
+        else:
+            logging.info(f"  DeepSeek并发润色（{self.concurrent_polish}线程）...")
 
         # 提交所有任务
         futures = {}
@@ -485,7 +579,10 @@ class VideoTranslator:
             if completed % max(1, total // 5) == 0 or completed == total:
                 logging.info(f"    润色进度: {completed}/{total} ({completed * 100 // total}%)")
 
-        logging.info(f"  [4/5] 并发润色完成 ✓")
+        if step_idx and step_total:
+            logging.info(f"  [{step_idx}/{step_total}] 并发润色完成 ✓")
+        else:
+            logging.info("  并发润色完成 ✓")
 
         # 显示润色示例
         if polish_examples:
@@ -565,24 +662,55 @@ class VideoTranslator:
         try:
             start_time = time.time()
 
+            total_steps = 4
+            if self.enable_vocal_separation:
+                total_steps += 1
+            if self.use_polish:
+                total_steps += 1
+
+            step = 1
+            temp_files = []
+
             # 1. 提取音频
-            logging.info("  [1/4] 提取音频...")
+            logging.info(f"  [{step}/{total_steps}] 提取音频...")
             audio_path = output_dir / f"{video_path.stem}_temp.wav"
+            audio_sep_path = output_dir / f"{video_path.stem}_temp_sep.wav"
+            vocals_path = output_dir / f"{video_path.stem}_temp_vocals.wav"
 
-            if not self.extract_audio(str(video_path), str(audio_path)):
-                raise Exception("音频提取失败")
-            logging.info("  [1/4] 提取音频完成 ✓")
+            if self.enable_vocal_separation:
+                # Demucs 建议使用较高采样率/双声道输入
+                temp_files.append(audio_sep_path)
+                if not self.extract_audio(str(video_path), str(audio_sep_path), sample_rate=44100, channels=2):
+                    raise Exception("音频提取失败")
+            else:
+                temp_files.append(audio_path)
+                if not self.extract_audio(str(video_path), str(audio_path)):
+                    raise Exception("音频提取失败")
+            logging.info(f"  [{step}/{total_steps}] 提取音频完成 ✓")
 
-            # 2. 语音识别
-            logging.info("  [2/4] 语音识别（长视频可能需要数分钟）...")
+            # 2. 人声分离（可选）
+            if self.enable_vocal_separation:
+                step += 1
+                logging.info(f"  [{step}/{total_steps}] 人声分离（Demucs，可能较慢）...")
+                temp_files.append(vocals_path)
+                self.separate_vocals(audio_sep_path, vocals_path)
+                asr_audio_path = vocals_path
+                logging.info(f"  [{step}/{total_steps}] 人声分离完成 ✓")
+            else:
+                asr_audio_path = audio_path
+
+            # 3. 语音识别
+            step += 1
+            logging.info(f"  [{step}/{total_steps}] 语音识别（长视频可能需要数分钟）...")
             transcribe_start = time.time()
-            result = self.transcribe(str(audio_path))
+            result = self.transcribe(str(asr_audio_path))
 
             # 删除临时音频
-            try:
-                audio_path.unlink()
-            except:
-                pass
+            for temp_path in temp_files:
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
 
             if not result or not result.get('success'):
                 raise Exception("语音识别失败")
@@ -590,11 +718,12 @@ class VideoTranslator:
             segments = result.get('segments', [])
             detected_lang = result.get('language', source_lang)
             transcribe_time = time.time() - transcribe_start
-            logging.info(f"  [2/4] 语音识别完成 ✓ ({len(segments)}段, {transcribe_time:.1f}秒)")
+            logging.info(f"  [{step}/{total_steps}] 语音识别完成 ✓ ({len(segments)}段, {transcribe_time:.1f}秒)")
 
-            # 3. 翻译（批量翻译）
+            # 4. 翻译（批量翻译）
+            step += 1
             translate_start = time.time()
-            logging.info(f"  [3/4] 翻译 {len(segments)} 段...")
+            logging.info(f"  [{step}/{total_steps}] 翻译 {len(segments)} 段...")
 
             for i, seg in enumerate(segments, 1):
                 translated = self.translate_text(
@@ -608,25 +737,28 @@ class VideoTranslator:
                 if i % max(1, len(segments) // 5) == 0 or i == len(segments):
                     logging.info(f"    翻译进度: {i}/{len(segments)} ({i * 100 // len(segments)}%)")
 
-            logging.info(f"  [3/4] 翻译完成 ✓")
+            logging.info(f"  [{step}/{total_steps}] 翻译完成 ✓")
 
-            # 4. 并发润色
+            # 5. 并发润色（可选）
             if self.use_polish:
+                step += 1
                 self.polish_batch_with_context(
                     segments,
                     detected_lang if source_lang == 'auto' else source_lang,
-                    target_lang
+                    target_lang,
+                    step_idx=step,
+                    step_total=total_steps
                 )
 
             translate_time = time.time() - translate_start
             polish_suffix = f" (含{self.concurrent_polish}线程并发润色)" if self.use_polish else ""
 
-            # 5. 生成字幕
-            step_num = 5 if self.use_polish else 4
-            logging.info(f"  [{step_num}/{step_num}] 生成字幕...")
+            # 6. 生成字幕
+            step += 1
+            logging.info(f"  [{step}/{total_steps}] 生成字幕...")
             if not self.generate_srt(segments, str(srt_path), translation_only):
                 raise Exception("生成字幕失败")
-            logging.info(f"  [{step_num}/{step_num}] 生成字幕完成 ✓")
+            logging.info(f"  [{step}/{total_steps}] 生成字幕完成 ✓")
 
             total_time = time.time() - start_time
 
@@ -706,6 +838,10 @@ class VideoTranslator:
             logging.info(f"DeepSeek润色: 启用（{self.concurrent_polish}线程并发）")
         else:
             logging.info(f"DeepSeek润色: 禁用")
+        if self.enable_vocal_separation:
+            logging.info(f"人声分离: 启用（Demucs {self.vocal_separation_model}, {self.vocal_separation_device}）")
+        else:
+            logging.info("人声分离: 禁用")
         logging.info(f"{'=' * 70}")
 
         # 处理每个视频
@@ -823,6 +959,16 @@ def main():
     parser.add_argument('--deepseek-key', help='DeepSeek API密钥')
     parser.add_argument('--service-url', default='http://127.0.0.1:50515',
                         help='翻译服务地址（默认: http://127.0.0.1:50515）')
+    parser.add_argument('--vocal-separation', action='store_true', default=None,
+                        help='启用人声分离（Demucs，用于背景音乐/嘈杂场景；需要 pip install demucs）')
+    parser.add_argument('--vocal-model', default=None,
+                        help='Demucs 模型名（默认: 读取config.ini 或 htdemucs）')
+    parser.add_argument('--vocal-device', default=None, choices=['auto', 'cpu', 'cuda'],
+                        help='人声分离设备：auto/cpu/cuda（默认: 读取config.ini 或 auto）')
+    parser.add_argument('--wait-ready', action='store_true',
+                        help='等待翻译服务就绪（首次下载/加载模型可能需要较长时间）')
+    parser.add_argument('--wait-timeout', type=int, default=3600,
+                        help='等待翻译服务就绪超时秒数（默认: 3600）')
     parser.add_argument('--show-progress', action='store_true', help='显示当前进度')
     parser.add_argument('--reset-progress', action='store_true', help='清除进度记录，从头开始')
 
@@ -849,12 +995,33 @@ def main():
     if not use_polish and CONFIG_AVAILABLE:
         use_polish = config.use_deepseek_polish
 
+    # 确定是否启用人声分离（命令行 > config.ini）
+    if args.vocal_separation is None:
+        enable_vocal_separation = config.enable_vocal_separation if CONFIG_AVAILABLE else False
+    else:
+        enable_vocal_separation = bool(args.vocal_separation)
+
+    vocal_separation_model = args.vocal_model
+    if not vocal_separation_model and CONFIG_AVAILABLE:
+        vocal_separation_model = config.vocal_separation_model
+    if not vocal_separation_model:
+        vocal_separation_model = 'htdemucs'
+
+    vocal_separation_device = args.vocal_device
+    if not vocal_separation_device and CONFIG_AVAILABLE:
+        vocal_separation_device = config.vocal_separation_device
+    if not vocal_separation_device:
+        vocal_separation_device = 'auto'
+
     # 创建翻译器
     translator = VideoTranslator(
         service_url=args.service_url,
         deepseek_key=args.deepseek_key,
         use_polish=use_polish,
-        concurrent_polish=args.concurrent
+        concurrent_polish=args.concurrent,
+        enable_vocal_separation=enable_vocal_separation,
+        vocal_separation_model=vocal_separation_model,
+        vocal_separation_device=vocal_separation_device
     )
 
     # 处理进度命令
@@ -885,8 +1052,17 @@ def main():
         cleanup_old_logs('log', keep_days, auto_cleanup)
 
     # 检查服务
-    if not translator.check_service():
+    if not translator.check_service(wait_ready=args.wait_ready, wait_timeout=args.wait_timeout):
         return 1
+
+    # 检查人声分离依赖
+    if enable_vocal_separation:
+        try:
+            import demucs  # noqa: F401
+        except Exception:
+            logging.error("× 已启用人声分离，但未安装 demucs")
+            logging.error("  请运行: pip install demucs")
+            return 1
 
     # 显示配置信息
     if use_polish or args.polish:

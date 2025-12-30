@@ -94,6 +94,22 @@ class Config:
     def use_deepseek_polish(self):
         return self.get_bool('Translation', 'use_deepseek_polish', False)
 
+    # 音频预处理
+    @property
+    def enable_vocal_separation(self):
+        """是否启用人声分离（Demucs）"""
+        return self.get_bool('Audio', 'enable_vocal_separation', False)
+
+    @property
+    def vocal_separation_model(self):
+        """Demucs 模型名"""
+        return self.get('Audio', 'vocal_separation_model', 'htdemucs')
+
+    @property
+    def vocal_separation_device(self):
+        """人声分离设备：auto / cpu / cuda"""
+        return self.get('Audio', 'vocal_separation_device', 'auto')
+
 
 # 全局配置实例
 config = Config()
@@ -109,3 +125,6 @@ if __name__ == '__main__':
     print(f"beam_size: {config.beam_size}")
     print(f"默认目标语言: {config.default_target_language}")
     print(f"使用DeepSeek润色: {config.use_deepseek_polish}")
+    print(f"启用人声分离: {config.enable_vocal_separation}")
+    print(f"人声分离模型: {config.vocal_separation_model}")
+    print(f"人声分离设备: {config.vocal_separation_device}")

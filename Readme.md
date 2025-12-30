@@ -18,6 +18,7 @@
 - **高质量** - 翻译质量接近/超越 Google Translate
 - **批量处理** - 支持目录批量翻译，自动断点续传
 - **GPU加速** - 支持 CUDA GPU 加速
+- **人声分离（可选）** - 使用 Demucs 提取人声，改善背景音乐/嘈杂场景识别效果
 - **可选润色** - 集成 DeepSeek API 进行专业级翻译润色
 - **灵活配置** - 支持多种模型和参数配置
 
@@ -75,6 +76,13 @@ beam_size = 3
 [Translation]
 default_target_language = zh
 use_deepseek_polish = true  # 启用DeepSeek润色
+
+[Audio]
+# 可选：人声分离（Demucs）提升背景音乐/嘈杂场景识别
+# 需要额外安装：pip install demucs
+enable_vocal_separation = false
+vocal_separation_model = htdemucs
+vocal_separation_device = cpu
 ```
 
 ### 5. 启动服务
@@ -303,6 +311,11 @@ python batch_translate.py <输入> [选项]
   --polish                 强制使用DeepSeek润色
   --deepseek-key KEY       指定DeepSeek API密钥
   --service-url URL        翻译服务地址
+  --vocal-separation       启用人声分离（Demucs，需要 pip install demucs）
+  --vocal-model NAME       Demucs 模型名（如: htdemucs / mdx_extra）
+  --vocal-device DEV       人声分离设备：auto/cpu/cuda
+  --wait-ready             等待翻译服务就绪（首次加载模型可能较久）
+  --wait-timeout SEC       等待服务就绪超时秒数（默认: 3600）
   --show-progress          显示当前进度
   --reset-progress         清除进度记录，从头开始
   -h, --help               显示帮助信息
@@ -328,6 +341,9 @@ python batch_translate.py video.mp4 -t zh --translation-only
 
 # 示例6: 中译英
 python batch_translate.py chinese_video.mp4 -t en -s zh --polish
+
+# 示例7: 嘈杂/背景音乐视频（启用人声分离）
+python batch_translate.py noisy.mp4 -t zh --vocal-separation --vocal-device cpu
 ```
 
 ## 📂 项目结构
