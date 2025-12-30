@@ -76,6 +76,21 @@ class Config:
     def service_port(self):
         return self.get_int('Service', 'port', 50515)
 
+    @property
+    def lazy_load_models(self):
+        """服务端是否启动时预加载模型（false=预加载；true=按需加载）"""
+        return self.get_bool('Service', 'lazy_load_models', False)
+
+    @property
+    def manage_models(self):
+        """客户端是否按需加载/卸载服务端模型（适合显存紧张环境）"""
+        return self.get_bool('Service', 'manage_models', False)
+
+    @property
+    def unload_models_after_tasks(self):
+        """客户端是否在 ASR/翻译完成后卸载模型释放显存"""
+        return self.get_bool('Service', 'unload_models_after_tasks', False)
+
     # 模型配置
     @property
     def asr_model_size(self):
@@ -144,6 +159,9 @@ if __name__ == '__main__':
     print("配置测试：")
     print(f"DeepSeek API密钥: {'已设置' if config.deepseek_api_key else '未设置'}")
     print(f"服务地址: {config.service_host}:{config.service_port}")
+    print(f"服务端按需加载模型: {config.lazy_load_models}")
+    print(f"客户端按需管理模型: {config.manage_models}")
+    print(f"任务后卸载模型: {config.unload_models_after_tasks}")
     print(f"ASR模型: {config.asr_model_size}")
     print(f"翻译模型: {config.translation_model}")
     print(f"使用GPU: {config.use_gpu}")

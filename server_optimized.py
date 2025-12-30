@@ -38,6 +38,15 @@ ASR_MODEL = None
 TRANSLATION_MODEL = None
 TOKENIZER = None
 
+# Defaults are populated in __main__ (and used by /models/load when payload omits fields)
+SERVICE_CONFIG = {
+    'asr_model_size': 'medium',
+    'translation_model': 'facebook/nllb-200-distilled-1.3B',
+    'use_gpu': True,
+    'device': 'cuda' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu',
+    'compute_type': 'float16' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'int8',
+}
+
 
 def _want_traceback() -> bool:
     v = os.environ.get('VTS_RETURN_TRACEBACK') or os.environ.get('RETURN_TRACEBACK') or ''
@@ -102,14 +111,15 @@ def _set_error(err_msg: str):
     STATUS['message'] = err_msg
     STATUS['error'] = err_msg
 
-def _load_models_async(asr_size: str, translation_name: str, device: str, compute_type: str):
+def _load_models_async(asr_size: str, translation_name: str, device: str, compute_type: str,
+                       load_asr: bool = True, load_translation: bool = True):
     """Background thread target to load models with phase updates."""
     global ASR_MODEL, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY, LOADING_THREAD
     try:
         if STATUS['started_at'] is None:
             STATUS['started_at'] = time.time()
         # ASR model
-        if WhisperModel and not ASR_READY:
+        if load_asr and WhisperModel and not ASR_READY:
             _set_status('asr_downloading', 0.02, f'Downloading/Preparing ASR model {asr_size} ...')
             try:
                 # faster-whisper downloads inside constructor
@@ -120,10 +130,10 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
             except Exception as e:
                 _set_error(f'ASR load failed: {e}')
                 return
-        elif ASR_READY:
+        elif load_asr and ASR_READY:
             _set_status('asr_ready', max(STATUS['progress'], 0.35), 'ASR already ready.')
         # Translation model - 使用m2m100或NLLB
-        if not TRANSLATION_READY:
+        if load_translation and not TRANSLATION_READY:
             # 检测是否是m2m100模型
             is_m2m100 = 'm2m100' in translation_name.lower()
             _set_status('translation_downloading', 0.4, f'Downloading translation model {translation_name} ...')
@@ -153,7 +163,7 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
                 import traceback
                 traceback.print_exc()
                 return
-        elif TRANSLATION_READY:
+        elif load_translation and TRANSLATION_READY:
             _set_status('translation_ready', max(STATUS['progress'], 0.85), 'Translation already ready.')
         if ASR_READY and TRANSLATION_READY:
             _set_status('ready', 1.0, 'All models ready.')
@@ -239,6 +249,148 @@ def init_models():
             LOADING_PARAMS.update({'asr_size': asr_size, 'translation_name': translation_name})
     return jsonify({'success': True, 'started': True, 'phase': STATUS['phase'], 'progress': STATUS['progress']})
 
+
+@app.route('/models/load', methods=['POST'])
+def models_load():
+    """
+    按需加载模型（避免启动时把 ASR + 翻译同时塞进显存）。
+
+    payload:
+      {
+        "models": ["asr"] | ["translation"] | ["asr","translation"],
+        "asr_model_size": "...",           # optional
+        "translation_model": "...",        # optional
+        "use_gpu": true/false,             # optional
+        "compute_type": "float16|int8"     # optional (ASR)
+      }
+    """
+    global LOADING_THREAD, LOADING_PARAMS
+    payload = request.json or {}
+    models = payload.get('models') or payload.get('model') or []
+    if isinstance(models, str):
+        models = [models]
+    if not isinstance(models, list):
+        return jsonify({'success': False, 'error': 'Invalid models'}), 400
+
+    want_asr = any(str(m).lower() in ('asr', 'whisper') for m in models)
+    want_translation = any(str(m).lower() in ('translation', 'translate', 'nllb', 'm2m100') for m in models)
+    if not want_asr and not want_translation:
+        return jsonify({'success': False, 'error': 'No models requested'}), 400
+
+    asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'medium')
+    translation_name = payload.get('translation_model') or payload.get('translation_name') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-distilled-1.3B')
+    want_gpu = payload.get('use_gpu')
+    if want_gpu is None:
+        want_gpu = SERVICE_CONFIG.get('use_gpu', True)
+    device = 'cuda' if bool(want_gpu) and _torch_cuda_available() else 'cpu'
+    compute_type = payload.get('compute_type') or ('float16' if device == 'cuda' else 'int8')
+
+    # If already ready for requested models, return immediately
+    if (not want_asr or ASR_READY) and (not want_translation or TRANSLATION_READY):
+        return jsonify({'success': True, 'already_ready': True, 'asr_ready': ASR_READY, 'translation_ready': TRANSLATION_READY, 'phase': STATUS['phase'], 'progress': STATUS['progress']})
+
+    with MODEL_LOCK:
+        if LOADING_THREAD is None:
+            _set_status('starting', 0.0, f"Starting model load thread ({'asr' if want_asr else ''}{'+' if want_asr and want_translation else ''}{'translation' if want_translation else ''}) ...")
+            LOADING_PARAMS = {
+                'asr_size': asr_size,
+                'translation_name': translation_name,
+                'device': device,
+                'compute_type': compute_type,
+                'load_asr': want_asr,
+                'load_translation': want_translation,
+            }
+            LOADING_THREAD = threading.Thread(
+                target=_load_models_async,
+                args=(asr_size, translation_name, device, compute_type, want_asr, want_translation),
+                daemon=True
+            )
+            LOADING_THREAD.start()
+        else:
+            # Thread already running; do not spawn another one.
+            pass
+
+    return jsonify({'success': True, 'started': True, 'asr_ready': ASR_READY, 'translation_ready': TRANSLATION_READY, 'phase': STATUS['phase'], 'progress': STATUS['progress']})
+
+
+@app.route('/models/unload', methods=['POST'])
+def models_unload():
+    """
+    卸载模型以释放显存。
+
+    payload:
+      { "models": ["asr"] | ["translation"] | ["all"] }
+    """
+    global ASR_MODEL, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY
+    payload = request.json or {}
+    models = payload.get('models') or payload.get('model') or ['all']
+    if isinstance(models, str):
+        models = [models]
+    if not isinstance(models, list):
+        return jsonify({'success': False, 'error': 'Invalid models'}), 400
+
+    want_all = any(str(m).lower() in ('all', '*') for m in models)
+    unload_asr = want_all or any(str(m).lower() in ('asr', 'whisper') for m in models)
+    unload_translation = want_all or any(str(m).lower() in ('translation', 'translate', 'nllb', 'm2m100') for m in models)
+
+    with MODEL_LOCK:
+        if unload_asr:
+            ASR_MODEL = None
+            ASR_READY = False
+        if unload_translation:
+            TRANSLATION_MODEL = None
+            TOKENIZER = None
+            TRANSLATION_READY = False
+
+        # Best-effort CUDA memory release
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+        try:
+            if torch and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if ASR_READY and TRANSLATION_READY:
+            _set_status('ready', 1.0, 'All models ready.')
+        elif ASR_READY:
+            _set_status('asr_ready', 0.35, 'ASR model ready.')
+        elif TRANSLATION_READY:
+            _set_status('translation_ready', 0.85, 'Translation model ready.')
+        else:
+            _set_status('idle', 0.0, 'No models loaded.')
+
+        free_bytes = None
+        total_bytes = None
+        allocated_bytes = None
+        reserved_bytes = None
+        try:
+            if torch and torch.cuda.is_available():
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                allocated_bytes = int(torch.cuda.memory_allocated())
+                reserved_bytes = int(torch.cuda.memory_reserved())
+        except Exception:
+            pass
+
+    return jsonify({
+        'success': True,
+        'asr_ready': ASR_READY,
+        'translation_ready': TRANSLATION_READY,
+        'cuda_available': bool(torch and torch.cuda.is_available()) if torch else False,
+        'free_bytes': int(free_bytes) if free_bytes is not None else None,
+        'total_bytes': int(total_bytes) if total_bytes is not None else None,
+        'allocated_bytes': allocated_bytes,
+        'reserved_bytes': reserved_bytes,
+    })
+
 @app.route('/transcribe', methods=['POST'])
 def transcribe():
     if not ASR_READY:
@@ -270,13 +422,15 @@ def transcribe():
             path = wav_path
         
         # ✅ 启用VAD，在语音边界截断，避免在单词中间切断
-        segments, info = ASR_MODEL.transcribe(
-            path, 
-            language=language, 
-            vad_filter=True,  # 使用VAD检测静音点，在语音边界截断
-            beam_size=5,
-            best_of=5
-        )
+        # 使用锁防止与 /models/unload 并发导致崩溃
+        with MODEL_LOCK:
+            segments, info = ASR_MODEL.transcribe(
+                path,
+                language=language,
+                vad_filter=True,  # 使用VAD检测静音点，在语音边界截断
+                beam_size=5,
+                best_of=5
+            )
         
         text = ''
         seg_list = []
@@ -474,6 +628,7 @@ if __name__ == '__main__':
     default_asr_model_size = getattr(app_config, 'asr_model_size', 'medium')
     default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-distilled-1.3B')
     default_use_gpu = getattr(app_config, 'use_gpu', True)
+    default_lazy_load = getattr(app_config, 'lazy_load_models', False)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default=default_host)
@@ -481,6 +636,10 @@ if __name__ == '__main__':
     parser.add_argument('--asr_model_size', default=default_asr_model_size)
     parser.add_argument('--translation_model', default=default_translation_model)  # 升级到1.3B（BLEU +8-10分）
     parser.add_argument('--no_gpu', action='store_true', help='强制使用CPU（忽略config.ini与CUDA检测）')
+    parser.add_argument('--lazy-load', dest='lazy_load', action='store_true', default=default_lazy_load,
+                        help='不要在启动时预加载模型，按需通过 /models/load 加载（适合显存紧张环境）')
+    parser.add_argument('--eager-load', dest='lazy_load', action='store_false',
+                        help='启动时预加载模型（覆盖 config.ini 的 lazy_load_models）')
     args = parser.parse_args()
     print('[PythonService] Starting with config:', args)
     print('[PythonService] HuggingFace endpoint:', os.environ.get('HF_ENDPOINT') or 'default')
@@ -501,16 +660,37 @@ if __name__ == '__main__':
         device_reason = 'CUDA not available'
 
     compute_type = 'float16' if device == 'cuda' else 'int8'
-    print(f'[PythonService] Auto-loading models: ASR={args.asr_model_size}, Translation={args.translation_model}, Device={device}')
+    if args.lazy_load:
+        print(f'[PythonService] Lazy-load mode: ASR={args.asr_model_size}, Translation={args.translation_model}, Device={device}')
+    else:
+        print(f'[PythonService] Auto-loading models: ASR={args.asr_model_size}, Translation={args.translation_model}, Device={device}')
     print(f'[PythonService] Device selection reason: {device_reason}')
     sys.stdout.flush()
+
+    # Expose defaults for /models/load (when payload omits fields)
+    try:
+        SERVICE_CONFIG.update({
+            'asr_model_size': args.asr_model_size,
+            'translation_model': args.translation_model,
+            'use_gpu': bool(device == 'cuda'),
+            'device': device,
+            'compute_type': compute_type,
+        })
+    except Exception:
+        pass
     
-    import threading
-    def load_models():
-        _load_models_async(args.asr_model_size, args.translation_model, device, compute_type)
-    
-    # 在后台线程加载模型，不阻塞Flask启动
-    loader_thread = threading.Thread(target=load_models, daemon=True)
-    loader_thread.start()
+    if args.lazy_load:
+        _set_status('idle', 0.0, 'Lazy-load enabled: models will be loaded on demand via /models/load.')
+        print('[PythonService] Lazy-load enabled: not preloading models.')
+        sys.stdout.flush()
+    else:
+        import threading
+
+        def load_models():
+            _load_models_async(args.asr_model_size, args.translation_model, device, compute_type)
+
+        # 在后台线程加载模型，不阻塞Flask启动
+        loader_thread = threading.Thread(target=load_models, daemon=True)
+        loader_thread.start()
     
     app.run(host=args.host, port=args.port, debug=False)

@@ -120,7 +120,8 @@ class VideoTranslator:
                  use_polish=False, concurrent_polish=10,
                  enable_vocal_separation=False, vocal_separation_model='htdemucs', vocal_separation_device='auto',
                  clear_cuda_cache_before_tasks=False,
-                 asr_chunk_sec=0, asr_chunk_overlap_sec=0.0):
+                 asr_chunk_sec=0, asr_chunk_overlap_sec=0.0,
+                 manage_models=False, unload_models_after_tasks=False, model_load_timeout=3600):
         self.service_url = service_url
 
         # 优先级：命令行参数 > 环境变量 > config.ini
@@ -143,6 +144,9 @@ class VideoTranslator:
         self.clear_cuda_cache_before_tasks = bool(clear_cuda_cache_before_tasks)
         self.asr_chunk_sec = int(asr_chunk_sec or 0)
         self.asr_chunk_overlap_sec = float(asr_chunk_overlap_sec or 0.0)
+        self.manage_models = bool(manage_models)
+        self.unload_models_after_tasks = bool(unload_models_after_tasks)
+        self.model_load_timeout = int(model_load_timeout or 3600)
 
         # 线程池用于并发润色
         if self.use_polish:
@@ -217,6 +221,95 @@ class VideoTranslator:
         except Exception:
             # 不影响主流程
             pass
+
+    def _service_models_load(self, models: list[str]) -> bool:
+        """让服务端按需加载指定模型（需要 server_optimized.py 支持 /models/load）。"""
+        try:
+            resp = requests.post(
+                f"{self.service_url}/models/load",
+                json={'models': models},
+                timeout=30
+            )
+        except Exception as e:
+            logging.error(f"  × 请求服务端加载模型失败: {e}")
+            return False
+
+        if resp.status_code == 404:
+            logging.error("  × 服务端不支持 /models/load：请更新 server_optimized.py")
+            return False
+
+        if resp.status_code != 200:
+            try:
+                logging.error(f"  × 服务端加载模型失败: {resp.status_code} {resp.json()}")
+            except Exception:
+                logging.error(f"  × 服务端加载模型失败: {resp.status_code} {resp.text[:500]}")
+            return False
+
+        return bool((resp.json() or {}).get('success', True))
+
+    def _service_models_unload(self, models: list[str]) -> bool:
+        """让服务端卸载指定模型以释放显存（需要 /models/unload）。"""
+        try:
+            resp = requests.post(
+                f"{self.service_url}/models/unload",
+                json={'models': models},
+                timeout=30
+            )
+        except Exception:
+            return False
+
+        if resp.status_code != 200:
+            return False
+        return True
+
+    def _wait_models_ready(self, want_asr: bool, want_translation: bool, timeout: int) -> bool:
+        """等待服务端指定模型就绪。"""
+        start = time.time()
+        last_log = 0.0
+        while True:
+            if time.time() - start > timeout:
+                logging.error(f"  × 等待模型加载超时（{timeout}秒）")
+                return False
+            try:
+                h = requests.get(f"{self.service_url}/health", timeout=5).json()
+            except Exception as e:
+                if time.time() - last_log >= 10:
+                    logging.info(f"    … 等待服务响应: {e}")
+                    last_log = time.time()
+                time.sleep(2)
+                continue
+
+            if h.get('phase') == 'error':
+                logging.error(f"  × 模型加载失败: {h.get('error') or '未知错误'}")
+                return False
+
+            asr_ready = bool(h.get('asr_ready'))
+            translation_ready = bool(h.get('translation_ready'))
+            if (not want_asr or asr_ready) and (not want_translation or translation_ready):
+                return True
+
+            now = time.time()
+            if now - last_log >= 10:
+                phase = h.get('phase')
+                pct = int((h.get('progress') or 0) * 100)
+                msg = h.get('message') or ''
+                logging.info(f"    … 模型加载中: {phase} ({pct}%) {msg}".rstrip())
+                last_log = now
+            time.sleep(2)
+
+    def ensure_models(self, want_asr: bool = False, want_translation: bool = False) -> bool:
+        """按需加载服务端模型，并等待就绪。"""
+        models: list[str] = []
+        if want_asr:
+            models.append('asr')
+        if want_translation:
+            models.append('translation')
+        if not models:
+            return True
+
+        if not self._service_models_load(models):
+            return False
+        return self._wait_models_ready(want_asr, want_translation, timeout=self.model_load_timeout)
 
     def load_progress(self, task_name):
         """加载进度文件"""
@@ -299,6 +392,9 @@ class VideoTranslator:
                     return True
 
                 if not wait_ready:
+                    if self.manage_models:
+                        logging.info("✓ 翻译服务正常运行（模型将按需加载）")
+                        return True
                     logging.error("× 翻译服务未就绪，请等待模型加载")
                     return False
 
@@ -1095,6 +1191,12 @@ class VideoTranslator:
             logging.info(f"  [{step}/{total_steps}] 语音识别（长视频可能需要数分钟）...")
             transcribe_start = time.time()
             asr_language = None if source_lang == 'auto' else source_lang
+            if self.manage_models:
+                # 避免与翻译模型同时占用显存
+                if self.unload_models_after_tasks:
+                    self._service_models_unload(['translation'])
+                if not self.ensure_models(want_asr=True):
+                    raise Exception("ASR模型加载失败")
             result = self.transcribe(str(asr_audio_path), language=asr_language)
 
             # 删除临时音频
@@ -1111,12 +1213,20 @@ class VideoTranslator:
             detected_lang = result.get('language', source_lang)
             transcribe_time = time.time() - transcribe_start
             logging.info(f"  [{step}/{total_steps}] 语音识别完成 ✓ ({len(segments)}段, {transcribe_time:.1f}秒)")
+            if self.manage_models and self.unload_models_after_tasks:
+                self._service_models_unload(['asr'])
 
             # 4. 翻译（批量翻译）
             step += 1
             translate_start = time.time()
             self.clear_cuda_cache('before_translation')
             logging.info(f"  [{step}/{total_steps}] 翻译 {len(segments)} 段...")
+            if self.manage_models:
+                # 确保 ASR 已释放（避免与翻译模型同时占用显存）
+                if self.unload_models_after_tasks:
+                    self._service_models_unload(['asr'])
+                if not self.ensure_models(want_translation=True):
+                    raise Exception("翻译模型加载失败")
 
             for i, seg in enumerate(segments, 1):
                 translated = self.translate_text(
@@ -1131,6 +1241,8 @@ class VideoTranslator:
                     logging.info(f"    翻译进度: {i}/{len(segments)} ({i * 100 // len(segments)}%)")
 
             logging.info(f"  [{step}/{total_steps}] 翻译完成 ✓")
+            if self.manage_models and self.unload_models_after_tasks:
+                self._service_models_unload(['translation'])
 
             # 5. 并发润色（可选）
             if self.use_polish:
@@ -1366,6 +1478,16 @@ def main():
                         help='ASR 分块秒数（启用进度条/降低长音频500/OOM；0=禁用；默认读取config.ini）')
     parser.add_argument('--asr-overlap-sec', type=float, default=None,
                         help='ASR 分块重叠秒数（避免切在单词中间；默认读取config.ini）')
+    parser.add_argument('--manage-models', dest='manage_models', action='store_true', default=None,
+                        help='按需加载/卸载服务端模型（适合显存紧张环境，如 Colab T4）')
+    parser.add_argument('--no-manage-models', dest='manage_models', action='store_false',
+                        help='禁用按需加载/卸载服务端模型')
+    parser.add_argument('--unload-models', dest='unload_models', action='store_true', default=None,
+                        help='在 ASR/翻译完成后卸载服务端模型释放显存（需要 --manage-models 或 config.ini）')
+    parser.add_argument('--no-unload-models', dest='unload_models', action='store_false',
+                        help='不在任务后卸载模型')
+    parser.add_argument('--model-load-timeout', type=int, default=None,
+                        help='等待服务端模型加载超时秒数（默认读取config.ini或3600）')
     parser.add_argument('--wait-ready', action='store_true',
                         help='等待翻译服务就绪（首次下载/加载模型可能需要较长时间）')
     parser.add_argument('--wait-timeout', type=int, default=3600,
@@ -1431,6 +1553,25 @@ def main():
     else:
         asr_chunk_overlap_sec = float(args.asr_overlap_sec)
 
+    # 按需加载/卸载服务端模型（命令行 > config.ini）
+    if args.manage_models is None:
+        manage_models = config.manage_models if CONFIG_AVAILABLE else False
+    else:
+        manage_models = bool(args.manage_models)
+
+    if args.unload_models is None:
+        unload_models_after_tasks = config.unload_models_after_tasks if CONFIG_AVAILABLE else False
+    else:
+        unload_models_after_tasks = bool(args.unload_models)
+
+    if unload_models_after_tasks:
+        manage_models = True
+
+    if args.model_load_timeout is None:
+        model_load_timeout = 3600
+    else:
+        model_load_timeout = int(args.model_load_timeout)
+
     # 创建翻译器
     translator = VideoTranslator(
         service_url=args.service_url,
@@ -1442,7 +1583,10 @@ def main():
         vocal_separation_device=vocal_separation_device,
         clear_cuda_cache_before_tasks=clear_cuda_cache_before_tasks,
         asr_chunk_sec=asr_chunk_sec,
-        asr_chunk_overlap_sec=asr_chunk_overlap_sec
+        asr_chunk_overlap_sec=asr_chunk_overlap_sec,
+        manage_models=manage_models,
+        unload_models_after_tasks=unload_models_after_tasks,
+        model_load_timeout=model_load_timeout
     )
 
     # 处理进度命令

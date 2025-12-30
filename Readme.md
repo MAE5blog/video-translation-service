@@ -67,6 +67,14 @@ copy config.template.ini config.ini
 # DeepSeek API密钥（可选，用于翻译润色）
 deepseek_api_key = sk-your-key-here
 
+[Service]
+host = 127.0.0.1
+port = 50515
+# 可选：显存紧张环境按需加载/卸载（如 Colab T4）
+lazy_load_models = false
+manage_models = false
+unload_models_after_tasks = false
+
 [Models]
 asr_model_size = medium
 translation_model = facebook/nllb-200-distilled-1.3B
