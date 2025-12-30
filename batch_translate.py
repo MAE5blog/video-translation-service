@@ -469,6 +469,29 @@ class VideoTranslator:
         except Exception as e:
             raise RuntimeError("已启用人声分离，但未安装 demucs：请先运行 `pip install demucs`") from e
 
+        def _ffprobe_duration_sec(path: Path) -> float | None:
+            try:
+                p = subprocess.run(
+                    [
+                        'ffprobe',
+                        '-v', 'error',
+                        '-show_entries', 'format=duration',
+                        '-of', 'default=noprint_wrappers=1:nokey=1',
+                        str(path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                if p.returncode != 0:
+                    return None
+                s = (p.stdout or '').strip()
+                if not s:
+                    return None
+                return float(s)
+            except Exception:
+                return None
+
         # 通过环境变量控制 Demucs 是否使用 GPU（避免依赖不同版本的 CLI 参数）
         env = os.environ.copy()
         if self.vocal_separation_device == 'cpu':
@@ -478,140 +501,255 @@ class VideoTranslator:
             # 注：PYTORCH_CUDA_ALLOC_CONF 已弃用，改用 PYTORCH_ALLOC_CONF
             env.setdefault('PYTORCH_ALLOC_CONF', 'max_split_size_mb:128')
 
-        tmp_dir = tempfile.mkdtemp(prefix='demucs_')
-        success = False
-        try:
-            cmd = [
-                sys.executable, '-m', 'demucs.separate',
-                '-n', self.vocal_separation_model,
-                '--two-stems', 'vocals',
-                '-o', tmp_dir,
-                str(input_audio_path)
-            ]
-            demucs_log_path = Path(tmp_dir) / 'demucs.log'
-            env.setdefault('PYTHONUNBUFFERED', '1')
+        def _run_demucs_one(track_path: Path, out_16k_wav_path: Path, label: str | None = None):
+            tmp_dir = tempfile.mkdtemp(prefix='demucs_')
+            success = False
+            try:
+                cmd = [
+                    sys.executable, '-m', 'demucs.separate',
+                    '-n', self.vocal_separation_model,
+                    '--two-stems', 'vocals',
+                    '-o', tmp_dir,
+                    str(track_path)
+                ]
+                demucs_log_path = Path(tmp_dir) / 'demucs.log'
+                env.setdefault('PYTHONUNBUFFERED', '1')
 
-            is_tty = sys.stdout.isatty()
-            percent_re = re.compile(r'(\d{1,3})%')
-            last_percent = None
-            next_log_percent = 10
-            spinner = ['|', '/', '-', '\\']
-            spinner_i = 0
-            start_time = time.time()
-            log_offset = 0
-            log_buf = ''
+                is_tty = sys.stdout.isatty()
+                percent_re = re.compile(r'(\d{1,3})%')
+                last_percent = None
+                next_log_percent = 10
+                spinner = ['|', '/', '-', '\\']
+                spinner_i = 0
+                start_time = time.time()
+                log_offset = 0
+                log_buf = ''
 
-            def _print_progress(text: str):
-                if not is_tty:
-                    return
-                sys.stdout.write(text)
-                sys.stdout.flush()
+                prefix = "    [Demucs]" if not label else f"    [Demucs {label}]"
 
-            with open(demucs_log_path, 'wb') as demucs_log:
-                proc = subprocess.Popen(
-                    cmd,
-                    env=env,
-                    stdout=demucs_log,
-                    stderr=subprocess.STDOUT,
-                )
+                def _print_progress(text: str):
+                    if not is_tty:
+                        return
+                    sys.stdout.write(text)
+                    sys.stdout.flush()
 
-                while True:
-                    rc = proc.poll()
+                with open(demucs_log_path, 'wb') as demucs_log:
+                    proc = subprocess.Popen(
+                        cmd,
+                        env=env,
+                        stdout=demucs_log,
+                        stderr=subprocess.STDOUT,
+                    )
 
-                    # 尝试从 demucs.log 读取新增内容并解析百分比
+                    while True:
+                        rc = proc.poll()
+
+                        # 尝试从 demucs.log 读取新增内容并解析百分比
+                        try:
+                            with open(demucs_log_path, 'rb') as f:
+                                f.seek(log_offset, os.SEEK_SET)
+                                data = f.read()
+                                log_offset = f.tell()
+                            if data:
+                                chunk = data.decode('utf-8', errors='replace')
+                                log_buf = (log_buf + chunk)[-50_000:]  # 仅保留末尾，避免无限增长
+                                matches = percent_re.findall(log_buf)
+                                if matches:
+                                    p = int(matches[-1])
+                                    if 0 <= p <= 100:
+                                        if last_percent is None:
+                                            last_percent = p
+                                        else:
+                                            # tqdm 可能会有多段进度条，允许在接近完成后重置
+                                            if p < last_percent and last_percent >= 95 and p <= 5:
+                                                last_percent = p
+                                                next_log_percent = 10
+                                            else:
+                                                last_percent = p
+                        except Exception:
+                            pass
+
+                        elapsed = int(time.time() - start_time)
+                        if last_percent is not None:
+                            bar_len = 24
+                            filled = int(bar_len * last_percent / 100)
+                            bar = '#' * filled + '.' * (bar_len - filled)
+                            _print_progress(f"\r{prefix} {last_percent:3d}% |{bar}| {elapsed}s")
+
+                            # notebook/非TTY：每10%记录一次，避免刷屏
+                            if (not is_tty) and last_percent >= next_log_percent:
+                                logging.info(f"{prefix} 进度: {last_percent}%")
+                                next_log_percent += 10
+                        else:
+                            _print_progress(f"\r{prefix} {spinner[spinner_i % len(spinner)]} 运行中... {elapsed}s")
+                            spinner_i += 1
+
+                        if rc is not None:
+                            break
+                        time.sleep(0.5)
+
+                    proc.wait()
+
+                if is_tty:
+                    # 清理进度行
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+                if proc.returncode != 0:
+                    # 避免 stdout PIPE 卡死：输出写入文件，失败时仅打印末尾
+                    tail_text = ''
                     try:
                         with open(demucs_log_path, 'rb') as f:
-                            f.seek(log_offset, os.SEEK_SET)
+                            f.seek(0, os.SEEK_END)
+                            size = f.tell()
+                            f.seek(max(0, size - 200_000), os.SEEK_SET)  # 只读末尾200KB
                             data = f.read()
-                            log_offset = f.tell()
-                        if data:
-                            chunk = data.decode('utf-8', errors='replace')
-                            log_buf = (log_buf + chunk)[-50_000:]  # 仅保留末尾，避免无限增长
-                            matches = percent_re.findall(log_buf)
-                            if matches:
-                                p = int(matches[-1])
-                                if 0 <= p <= 100:
-                                    if last_percent is None:
-                                        last_percent = p
-                                    else:
-                                        # tqdm 可能会有多段进度条，允许在接近完成后重置
-                                        if p < last_percent and last_percent >= 95 and p <= 5:
-                                            last_percent = p
-                                            next_log_percent = 10
-                                        else:
-                                            last_percent = p
+                        tail_text = data.decode('utf-8', errors='replace').strip()
                     except Exception:
-                        pass
+                        tail_text = ''
+                    if tail_text:
+                        tail = "\n".join(tail_text.splitlines()[-200:])
+                        logging.error("  × Demucs 输出（最后200行）：\n" + tail)
+                    logging.error(f"  ! Demucs 日志文件: {demucs_log_path}")
+                    if 'TorchCodec is required' in tail_text or "No module named 'torchcodec'" in tail_text:
+                        raise RuntimeError("Demucs 依赖 torchcodec 保存音频：请先运行 `pip install torchcodec` 再重试") from None
+                    if proc.returncode == -9:
+                        raise RuntimeError("Demucs 被系统终止（exit code=-9）：通常是 CPU 内存不足（OOM kill）。建议启用分段人声分离或缩短分段时长。") from None
+                    raise RuntimeError(f"Demucs 执行失败（exit code={proc.returncode}）: {' '.join(cmd)}")
 
-                    elapsed = int(time.time() - start_time)
-                    if last_percent is not None:
-                        bar_len = 24
-                        filled = int(bar_len * last_percent / 100)
-                        bar = '#' * filled + '.' * (bar_len - filled)
-                        _print_progress(f"\r    [Demucs] {last_percent:3d}% |{bar}| {elapsed}s")
+                tmp_dir_path = Path(tmp_dir)
+                candidates = list(tmp_dir_path.rglob('vocals.wav'))
+                if not candidates:
+                    candidates = [p for p in tmp_dir_path.rglob('vocals.*') if p.is_file()]
+                if not candidates:
+                    raise FileNotFoundError(f"Demucs 输出未找到：{tmp_dir}")
 
-                        # notebook/非TTY：每10%记录一次，避免刷屏
-                        if (not is_tty) and last_percent >= next_log_percent:
-                            logging.info(f"    [Demucs] 进度: {last_percent}%")
-                            next_log_percent += 10
-                    else:
-                        _print_progress(f"\r    [Demucs] {spinner[spinner_i % len(spinner)]} 运行中... {elapsed}s")
-                        spinner_i += 1
+                vocals_path = candidates[0]
+                cmd = [
+                    'ffmpeg', '-i', str(vocals_path),
+                    '-vn', '-acodec', 'pcm_s16le',
+                    '-ar', '16000', '-ac', '1',
+                    '-y', str(out_16k_wav_path)
+                ]
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if not out_16k_wav_path.exists():
+                    raise FileNotFoundError(f"人声分离输出未生成: {out_16k_wav_path}")
+                success = True
+            finally:
+                if success:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                else:
+                    logging.error(f"  ! Demucs 临时目录已保留用于排查: {tmp_dir}")
 
-                    if rc is not None:
-                        break
-                    time.sleep(0.5)
+        # 超长音频：避免 demucs/torchaudio 一次性加载到内存导致 OOM kill（exit code=-9）
+        size_bytes = None
+        try:
+            size_bytes = input_audio_path.stat().st_size
+        except Exception:
+            size_bytes = None
+        duration_sec = _ffprobe_duration_sec(input_audio_path)
 
-                proc.wait()
+        # 触发条件：>1小时 或 >512MB（约 48min 的 44.1kHz/2ch/16bit PCM）
+        enable_chunk = True
+        chunk_sec = 600
+        chunk_threshold_sec = 3600
+        size_threshold_bytes = 512 * 1024 * 1024
+        should_chunk = (
+            enable_chunk
+            and chunk_sec > 0
+            and (
+                (duration_sec is not None and duration_sec >= chunk_threshold_sec)
+                or (size_bytes is not None and size_bytes >= size_threshold_bytes)
+            )
+        )
 
-            if is_tty:
-                # 清理进度行
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+        if not should_chunk:
+            _run_demucs_one(input_audio_path, output_wav_path)
+            return
 
-            if proc.returncode != 0:
-                # 避免 stdout PIPE 卡死：输出写入文件，失败时仅打印末尾
-                tail_text = ''
-                try:
-                    with open(demucs_log_path, 'rb') as f:
-                        f.seek(0, os.SEEK_END)
-                        size = f.tell()
-                        f.seek(max(0, size - 200_000), os.SEEK_SET)  # 只读末尾200KB
-                        data = f.read()
-                    tail_text = data.decode('utf-8', errors='replace').strip()
-                except Exception:
-                    tail_text = ''
-                if tail_text:
-                    tail = "\n".join(tail_text.splitlines()[-200:])
-                    logging.error("  × Demucs 输出（最后200行）：\n" + tail)
-                logging.error(f"  ! Demucs 日志文件: {demucs_log_path}")
-                if 'TorchCodec is required' in tail_text or "No module named 'torchcodec'" in tail_text:
-                    raise RuntimeError("Demucs 依赖 torchcodec 保存音频：请先运行 `pip install torchcodec` 再重试") from None
-                raise RuntimeError(f"Demucs 执行失败（exit code={proc.returncode}）: {' '.join(cmd)}")
+        work_dir = tempfile.mkdtemp(prefix='demucs_chunks_')
+        work_path = Path(work_dir)
+        success = False
+        try:
+            if duration_sec is not None:
+                logging.info(f"    [Demucs] 检测到长音频（{duration_sec/60:.1f}分钟），启用分段处理：{chunk_sec}s/段")
+            elif size_bytes is not None:
+                logging.info(f"    [Demucs] 检测到大音频（{size_bytes/(1024**3):.2f}GB），启用分段处理：{chunk_sec}s/段")
+            else:
+                logging.info(f"    [Demucs] 启用分段处理：{chunk_sec}s/段")
 
-            tmp_dir_path = Path(tmp_dir)
-            candidates = list(tmp_dir_path.rglob('vocals.wav'))
-            if not candidates:
-                candidates = [p for p in tmp_dir_path.rglob('vocals.*') if p.is_file()]
-            if not candidates:
-                raise FileNotFoundError(f"Demucs 输出未找到：{tmp_dir}")
-
-            vocals_path = candidates[0]
+            chunk_pattern = work_path / 'chunk_%06d.wav'
             cmd = [
-                'ffmpeg', '-i', str(vocals_path),
-                '-vn', '-acodec', 'pcm_s16le',
-                '-ar', '16000', '-ac', '1',
-                '-y', str(output_wav_path)
+                'ffmpeg',
+                '-i', str(input_audio_path),
+                '-vn',
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100', '-ac', '2',
+                '-f', 'segment',
+                '-segment_time', str(int(chunk_sec)),
+                '-reset_timestamps', '1',
+                '-y', str(chunk_pattern),
             ]
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            chunks = sorted(work_path.glob('chunk_*.wav'))
+            if not chunks:
+                raise RuntimeError("分段失败：未生成任何音频分段文件")
+
+            # 分段生成后即可删除原始大文件，避免占用磁盘（若失败可从视频重新提取）
+            try:
+                if size_bytes is not None and size_bytes >= size_threshold_bytes and input_audio_path.exists():
+                    input_audio_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            chunk_vocals = []
+            total = len(chunks)
+            for i, chunk_path in enumerate(chunks, 1):
+                label = f"{i}/{total}"
+                out_chunk = work_path / f"vocals_{i:06d}.wav"
+                _run_demucs_one(chunk_path, out_chunk, label=label)
+                chunk_vocals.append(out_chunk)
+
+            concat_list = work_path / 'concat.txt'
+            with open(concat_list, 'w', encoding='utf-8') as f:
+                for p in chunk_vocals:
+                    pp = str(p).replace("'", "'\\''")
+                    f.write(f"file '{pp}'\n")
+
+            # 优先用 -c copy（同一编码参数的 WAV 可直接拼接），失败则回退到重编码
+            concat_cmd = [
+                'ffmpeg',
+                '-f', 'concat',
+                '-safe', '0',
+                '-i', str(concat_list),
+                '-c', 'copy',
+                '-y', str(output_wav_path),
+            ]
+            try:
+                subprocess.run(concat_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                concat_cmd = [
+                    'ffmpeg',
+                    '-f', 'concat',
+                    '-safe', '0',
+                    '-i', str(concat_list),
+                    '-vn',
+                    '-acodec', 'pcm_s16le',
+                    '-ar', '16000', '-ac', '1',
+                    '-y', str(output_wav_path),
+                ]
+                subprocess.run(concat_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
             if not output_wav_path.exists():
                 raise FileNotFoundError(f"人声分离输出未生成: {output_wav_path}")
+
             success = True
         finally:
             if success:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                shutil.rmtree(work_dir, ignore_errors=True)
             else:
-                logging.error(f"  ! Demucs 临时目录已保留用于排查: {tmp_dir}")
+                logging.error(f"  ! Demucs 分段临时目录已保留用于排查: {work_dir}")
 
     @staticmethod
     def _trim_text_overlap(prev_text: str, text: str, max_words: int = 12) -> str:
@@ -1144,6 +1282,7 @@ class VideoTranslator:
         # 标记为处理中
         self.update_video_status(video_name, 'processing')
 
+        temp_files = []
         try:
             start_time = time.time()
 
@@ -1154,7 +1293,6 @@ class VideoTranslator:
                 total_steps += 1
 
             step = 1
-            temp_files = []
 
             # 1. 提取音频
             logging.info(f"  [{step}/{total_steps}] 提取音频...")
@@ -1297,6 +1435,13 @@ class VideoTranslator:
 
             self.stats['failed'] += 1
             return False
+        finally:
+            # 失败时也尽量清理临时文件，避免超长视频遗留超大 WAV 占用磁盘
+            for temp_path in temp_files:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def translate_directory(self, directory, target_lang='zh', source_lang='auto',
                             translation_only=False, recursive=False, output_dir=None):
