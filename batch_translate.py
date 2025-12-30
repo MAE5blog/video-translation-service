@@ -387,18 +387,30 @@ class VideoTranslator:
                 '-o', tmp_dir,
                 str(input_audio_path)
             ]
-            proc = subprocess.run(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            demucs_log_path = Path(tmp_dir) / 'demucs.log'
+            with open(demucs_log_path, 'wb') as demucs_log:
+                proc = subprocess.run(
+                    cmd,
+                    env=env,
+                    stdout=demucs_log,
+                    stderr=subprocess.STDOUT,
+                )
             if proc.returncode != 0:
-                out = (proc.stdout or '').strip()
-                if out:
-                    tail = "\n".join(out.splitlines()[-200:])
+                # 避免 stdout PIPE 卡死：输出写入文件，失败时仅打印末尾
+                tail_text = ''
+                try:
+                    with open(demucs_log_path, 'rb') as f:
+                        f.seek(0, os.SEEK_END)
+                        size = f.tell()
+                        f.seek(max(0, size - 200_000), os.SEEK_SET)  # 只读末尾200KB
+                        data = f.read()
+                    tail_text = data.decode('utf-8', errors='replace').strip()
+                except Exception:
+                    tail_text = ''
+                if tail_text:
+                    tail = "\n".join(tail_text.splitlines()[-200:])
                     logging.error("  × Demucs 输出（最后200行）：\n" + tail)
+                logging.error(f"  ! Demucs 日志文件: {demucs_log_path}")
                 raise RuntimeError(f"Demucs 执行失败（exit code={proc.returncode}）: {' '.join(cmd)}")
 
             tmp_dir_path = Path(tmp_dir)
