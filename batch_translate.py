@@ -116,7 +116,8 @@ class VideoTranslator:
 
     def __init__(self, service_url='http://127.0.0.1:50515', deepseek_key=None,
                  use_polish=False, concurrent_polish=10,
-                 enable_vocal_separation=False, vocal_separation_model='htdemucs', vocal_separation_device='auto'):
+                 enable_vocal_separation=False, vocal_separation_model='htdemucs', vocal_separation_device='auto',
+                 clear_cuda_cache_before_tasks=False):
         self.service_url = service_url
 
         # 优先级：命令行参数 > 环境变量 > config.ini
@@ -136,6 +137,7 @@ class VideoTranslator:
         self.enable_vocal_separation = enable_vocal_separation
         self.vocal_separation_model = vocal_separation_model
         self.vocal_separation_device = (vocal_separation_device or 'auto').lower()
+        self.clear_cuda_cache_before_tasks = bool(clear_cuda_cache_before_tasks)
 
         # 线程池用于并发润色
         if self.use_polish:
@@ -165,6 +167,51 @@ class VideoTranslator:
         """清理线程池"""
         if hasattr(self, 'polish_executor'):
             self.polish_executor.shutdown(wait=True)
+
+    def clear_cuda_cache(self, stage: str):
+        """清理 CUDA 显存缓存（尽量减少 OOM 概率）"""
+        if not self.clear_cuda_cache_before_tasks:
+            return
+
+        # 1) 当前进程（若安装了 torch）
+        try:
+            import gc
+
+            gc.collect()
+        except Exception:
+            pass
+
+        try:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2) 服务端进程（如果提供了 /gpu/clear）
+        try:
+            response = requests.post(
+                f"{self.service_url}/gpu/clear",
+                json={'stage': stage},
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json() or {}
+                if data.get('cuda_available') and data.get('free_bytes') and data.get('total_bytes'):
+                    free_gb = data['free_bytes'] / (1024 ** 3)
+                    total_gb = data['total_bytes'] / (1024 ** 3)
+                    logging.info(f"    [GPU] 已清理缓存: {stage}（free {free_gb:.1f}GB / total {total_gb:.1f}GB）")
+        except Exception:
+            # 不影响主流程
+            pass
 
     def load_progress(self, task_name):
         """加载进度文件"""
@@ -325,6 +372,9 @@ class VideoTranslator:
         env = os.environ.copy()
         if self.vocal_separation_device == 'cpu':
             env['CUDA_VISIBLE_DEVICES'] = ''
+        elif self.vocal_separation_device == 'cuda':
+            # 尽量减少显存碎片导致的 OOM（不覆盖用户已有设置）
+            env.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
 
         with tempfile.TemporaryDirectory(prefix='demucs_') as tmp_dir:
             cmd = [
@@ -691,6 +741,7 @@ class VideoTranslator:
             # 2. 人声分离（可选）
             if self.enable_vocal_separation:
                 step += 1
+                self.clear_cuda_cache('before_vocal_separation')
                 logging.info(f"  [{step}/{total_steps}] 人声分离（Demucs，可能较慢）...")
                 temp_files.append(vocals_path)
                 self.separate_vocals(audio_sep_path, vocals_path)
@@ -701,6 +752,7 @@ class VideoTranslator:
 
             # 3. 语音识别
             step += 1
+            self.clear_cuda_cache('before_asr')
             logging.info(f"  [{step}/{total_steps}] 语音识别（长视频可能需要数分钟）...")
             transcribe_start = time.time()
             result = self.transcribe(str(asr_audio_path))
@@ -723,6 +775,7 @@ class VideoTranslator:
             # 4. 翻译（批量翻译）
             step += 1
             translate_start = time.time()
+            self.clear_cuda_cache('before_translation')
             logging.info(f"  [{step}/{total_steps}] 翻译 {len(segments)} 段...")
 
             for i, seg in enumerate(segments, 1):
@@ -965,6 +1018,10 @@ def main():
                         help='Demucs 模型名（默认: 读取config.ini 或 htdemucs）')
     parser.add_argument('--vocal-device', default=None, choices=['auto', 'cpu', 'cuda'],
                         help='人声分离设备：auto/cpu/cuda（默认: 读取config.ini 或 auto）')
+    parser.add_argument('--cuda-clear', dest='cuda_clear', action='store_true', default=None,
+                        help='在GPU重任务前清理CUDA缓存（降低OOM概率，略慢）')
+    parser.add_argument('--no-cuda-clear', dest='cuda_clear', action='store_false',
+                        help='禁用GPU任务前清理CUDA缓存')
     parser.add_argument('--wait-ready', action='store_true',
                         help='等待翻译服务就绪（首次下载/加载模型可能需要较长时间）')
     parser.add_argument('--wait-timeout', type=int, default=3600,
@@ -1013,6 +1070,12 @@ def main():
     if not vocal_separation_device:
         vocal_separation_device = 'auto'
 
+    # 是否在 GPU 重任务前清理 CUDA 缓存（命令行 > config.ini）
+    if args.cuda_clear is None:
+        clear_cuda_cache_before_tasks = config.clear_cuda_cache_before_tasks if CONFIG_AVAILABLE else False
+    else:
+        clear_cuda_cache_before_tasks = bool(args.cuda_clear)
+
     # 创建翻译器
     translator = VideoTranslator(
         service_url=args.service_url,
@@ -1021,7 +1084,8 @@ def main():
         concurrent_polish=args.concurrent,
         enable_vocal_separation=enable_vocal_separation,
         vocal_separation_model=vocal_separation_model,
-        vocal_separation_device=vocal_separation_device
+        vocal_separation_device=vocal_separation_device,
+        clear_cuda_cache_before_tasks=clear_cuda_cache_before_tasks
     )
 
     # 处理进度命令

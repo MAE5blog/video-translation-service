@@ -3,6 +3,7 @@ import io
 import time
 import sys
 import threading
+from contextlib import nullcontext as _nullcontext
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 from typing import Optional
@@ -95,21 +96,31 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
             is_m2m100 = 'm2m100' in translation_name.lower()
             _set_status('translation_downloading', 0.4, f'Downloading translation model {translation_name} ...')
             try:
+                model_kwargs = {}
+                if torch and device == 'cuda':
+                    # 显存优化：直接以 FP16 加载，降低显存占用（更适合 T4 等 16GB 显存环境）
+                    model_kwargs.update({'torch_dtype': torch.float16, 'low_cpu_mem_usage': True})
+
                 if is_m2m100 and M2M100Tokenizer and M2M100ForConditionalGeneration:
                     print(f'[Translation] Using M2M100 model: {translation_name}')
                     TOKENIZER = M2M100Tokenizer.from_pretrained(translation_name, cache_dir='./models/m2m100')
                     _set_status('translation_loading', 0.55, f'Loading translation model {translation_name} ...')
-                    TRANSLATION_MODEL = M2M100ForConditionalGeneration.from_pretrained(translation_name, cache_dir='./models/m2m100')
+                    TRANSLATION_MODEL = M2M100ForConditionalGeneration.from_pretrained(
+                        translation_name, cache_dir='./models/m2m100', **model_kwargs
+                    )
                 elif AutoTokenizer and AutoModelForSeq2SeqLM:
                     print(f'[Translation] Using NLLB model: {translation_name}')
                     TOKENIZER = AutoTokenizer.from_pretrained(translation_name, cache_dir='./models/nllb')
                     _set_status('translation_loading', 0.55, f'Loading translation model {translation_name} ...')
-                    TRANSLATION_MODEL = AutoModelForSeq2SeqLM.from_pretrained(translation_name, cache_dir='./models/nllb')
+                    TRANSLATION_MODEL = AutoModelForSeq2SeqLM.from_pretrained(
+                        translation_name, cache_dir='./models/nllb', **model_kwargs
+                    )
                 else:
                     raise ImportError('No translation library available')
                     
                 if torch and device == 'cuda':
                     TRANSLATION_MODEL = TRANSLATION_MODEL.to(device)
+                    TRANSLATION_MODEL.eval()
                 TRANSLATION_READY = True
                 _set_status('translation_ready', 0.85, f'Translation model ready ({translation_name}).')
                 print(f'[Translation] Model loaded successfully: {translation_name}')
@@ -140,6 +151,39 @@ def health():
         'error': STATUS['error'],
         'ready': ASR_READY and TRANSLATION_READY
     })
+
+@app.route('/gpu/clear', methods=['POST'])
+def gpu_clear():
+    """清理 CUDA 缓存（用于降低 OOM 概率）"""
+    if not torch or not torch.cuda.is_available():
+        return jsonify({'success': True, 'cuda_available': False})
+
+    payload = request.json or {}
+    stage = payload.get('stage') or payload.get('label') or payload.get('reason')
+
+    with MODEL_LOCK:
+        try:
+            import gc
+
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            return jsonify({
+                'success': True,
+                'cuda_available': True,
+                'stage': stage,
+                'free_bytes': int(free_bytes),
+                'total_bytes': int(total_bytes),
+                'allocated_bytes': int(torch.cuda.memory_allocated()),
+                'reserved_bytes': int(torch.cuda.memory_reserved()),
+            })
+        except Exception as e:
+            return jsonify({'success': False, 'cuda_available': True, 'stage': stage, 'error': str(e)}), 500
 
 @app.route('/init', methods=['POST'])
 def init_models():
@@ -257,39 +301,40 @@ def translate():
     try:
         # 使用锁防止并发访问模型（修复"Already borrowed"错误）
         with MODEL_LOCK:
-            if is_m2m100:
-                # M2M100翻译流程
-                src_code = m2m100_lang_map.get(src_lang, src_lang)
-                tgt_code = m2m100_lang_map.get(tgt_lang, tgt_lang)
-                TOKENIZER.src_lang = src_code
-                inputs = TOKENIZER(text, return_tensors='pt')
-                if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
-                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                # M2M100使用forced_bos_token_id指定目标语言
-                tgt_lang_id = TOKENIZER.get_lang_id(tgt_code)
-                gen_tokens = TRANSLATION_MODEL.generate(
-                    **inputs, 
-                    forced_bos_token_id=tgt_lang_id,
-                    max_length=512, 
-                    num_beams=3,
-                    early_stopping=True
-                )
-                decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
-            else:
-                # NLLB翻译流程
-                src_code = nllb_lang_map.get(src_lang, src_lang)
-                tgt_code = nllb_lang_map.get(tgt_lang, tgt_lang)
-                TOKENIZER.src_lang = src_code
-                inputs = TOKENIZER(text, return_tensors='pt')
-                if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
-                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                gen_tokens = TRANSLATION_MODEL.generate(
-                    **inputs, 
-                    forced_bos_token_id=TOKENIZER.convert_tokens_to_ids(tgt_code), 
-                    max_length=512, 
-                    num_beams=3
-                )
-                decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
+            with (torch.inference_mode() if torch else _nullcontext()):
+                if is_m2m100:
+                    # M2M100翻译流程
+                    src_code = m2m100_lang_map.get(src_lang, src_lang)
+                    tgt_code = m2m100_lang_map.get(tgt_lang, tgt_lang)
+                    TOKENIZER.src_lang = src_code
+                    inputs = TOKENIZER(text, return_tensors='pt')
+                    if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
+                        inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                    # M2M100使用forced_bos_token_id指定目标语言
+                    tgt_lang_id = TOKENIZER.get_lang_id(tgt_code)
+                    gen_tokens = TRANSLATION_MODEL.generate(
+                        **inputs,
+                        forced_bos_token_id=tgt_lang_id,
+                        max_length=512,
+                        num_beams=3,
+                        early_stopping=True
+                    )
+                    decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
+                else:
+                    # NLLB翻译流程
+                    src_code = nllb_lang_map.get(src_lang, src_lang)
+                    tgt_code = nllb_lang_map.get(tgt_lang, tgt_lang)
+                    TOKENIZER.src_lang = src_code
+                    inputs = TOKENIZER(text, return_tensors='pt')
+                    if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
+                        inputs = {k: v.to('cuda') for k, v in inputs.items()}
+                    gen_tokens = TRANSLATION_MODEL.generate(
+                        **inputs,
+                        forced_bos_token_id=TOKENIZER.convert_tokens_to_ids(tgt_code),
+                        max_length=512,
+                        num_beams=3
+                    )
+                    decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
         
         if not decoded:
             return jsonify({'success': False, 'error': 'Translation produced empty result'}), 500

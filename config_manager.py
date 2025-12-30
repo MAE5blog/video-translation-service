@@ -85,6 +85,12 @@ class Config:
     def beam_size(self):
         return self.get_int('Models', 'beam_size', 3)
 
+    # GPU运行配置
+    @property
+    def clear_cuda_cache_before_tasks(self):
+        """是否在 GPU 重任务前清理 CUDA 显存缓存（torch.cuda.empty_cache）"""
+        return self.get_bool('GPU', 'clear_cuda_cache_before_tasks', False)
+
     # 翻译配置
     @property
     def default_target_language(self):
@@ -123,6 +129,7 @@ if __name__ == '__main__':
     print(f"翻译模型: {config.translation_model}")
     print(f"使用GPU: {config.use_gpu}")
     print(f"beam_size: {config.beam_size}")
+    print(f"GPU任务前清理显存缓存: {config.clear_cuda_cache_before_tasks}")
     print(f"默认目标语言: {config.default_target_language}")
     print(f"使用DeepSeek润色: {config.use_deepseek_polish}")
     print(f"启用人声分离: {config.enable_vocal_separation}")

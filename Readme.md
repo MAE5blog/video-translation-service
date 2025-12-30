@@ -73,6 +73,10 @@ translation_model = facebook/nllb-200-distilled-1.3B
 use_gpu = true
 beam_size = 3
 
+[GPU]
+# 可选：在 GPU 重任务前清理 CUDA 缓存（降低 OOM 概率，略慢）
+clear_cuda_cache_before_tasks = true
+
 [Translation]
 default_target_language = zh
 use_deepseek_polish = true  # 启用DeepSeek润色
@@ -82,7 +86,7 @@ use_deepseek_polish = true  # 启用DeepSeek润色
 # 需要额外安装：pip install demucs
 enable_vocal_separation = false
 vocal_separation_model = htdemucs
-vocal_separation_device = cpu
+vocal_separation_device = cuda  # 如遇 OOM 可改为 cpu
 ```
 
 ### 5. 启动服务
@@ -314,6 +318,8 @@ python batch_translate.py <输入> [选项]
   --vocal-separation       启用人声分离（Demucs，需要 pip install demucs）
   --vocal-model NAME       Demucs 模型名（如: htdemucs / mdx_extra）
   --vocal-device DEV       人声分离设备：auto/cpu/cuda
+  --cuda-clear             在GPU重任务前清理CUDA缓存（降低OOM概率，略慢）
+  --no-cuda-clear          禁用GPU任务前清理CUDA缓存
   --wait-ready             等待翻译服务就绪（首次加载模型可能较久）
   --wait-timeout SEC       等待服务就绪超时秒数（默认: 3600）
   --show-progress          显示当前进度
@@ -343,7 +349,7 @@ python batch_translate.py video.mp4 -t zh --translation-only
 python batch_translate.py chinese_video.mp4 -t en -s zh --polish
 
 # 示例7: 嘈杂/背景音乐视频（启用人声分离）
-python batch_translate.py noisy.mp4 -t zh --vocal-separation --vocal-device cpu
+python batch_translate.py noisy.mp4 -t zh --vocal-separation --vocal-device cuda --cuda-clear
 ```
 
 ## 📂 项目结构
