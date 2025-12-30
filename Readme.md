@@ -91,8 +91,9 @@ clear_cuda_cache_before_tasks = true
 language = auto
 
 # 可选：分块识别（显示进度条/降低长音频500/OOM；0=禁用）
-chunk_sec = 300
-chunk_overlap_sec = 0.5
+# 建议从 900（15分钟）起步，不稳定再降到 600/300
+chunk_sec = 900
+chunk_overlap_sec = 1.0
 
 [Translation]
 default_target_language = zh
