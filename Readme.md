@@ -99,6 +99,10 @@ chunk_overlap_sec = 1.0
 default_target_language = zh
 use_deepseek_polish = true  # 启用DeepSeek润色
 
+[Subtitles]
+# 字幕格式：srt / ass
+format = srt
+
 [Audio]
 # 可选：人声分离（Demucs）提升背景音乐/嘈杂场景识别
 # 需要额外安装：pip install demucs
@@ -255,6 +259,10 @@ default_target_language = zh
 
 # 是否默认使用DeepSeek润色
 use_deepseek_polish = true
+
+[Subtitles]
+# 字幕格式：srt / ass
+format = srt
 ```
 
 ### 模型选择

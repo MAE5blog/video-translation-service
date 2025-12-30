@@ -139,6 +139,13 @@ class Config:
     def use_deepseek_polish(self):
         return self.get_bool('Translation', 'use_deepseek_polish', False)
 
+    # 字幕输出
+    @property
+    def subtitle_format(self):
+        """字幕格式：srt / ass"""
+        v = (self.get('Subtitles', 'format', 'srt') or 'srt').strip().lower()
+        return v if v in ('srt', 'ass') else 'srt'
+
     # 音频预处理
     @property
     def enable_vocal_separation(self):
