@@ -376,7 +376,8 @@ class VideoTranslator:
             env['CUDA_VISIBLE_DEVICES'] = ''
         elif self.vocal_separation_device == 'cuda':
             # 尽量减少显存碎片导致的 OOM（不覆盖用户已有设置）
-            env.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
+            # 注：PYTORCH_CUDA_ALLOC_CONF 已弃用，改用 PYTORCH_ALLOC_CONF
+            env.setdefault('PYTORCH_ALLOC_CONF', 'max_split_size_mb:128')
 
         tmp_dir = tempfile.mkdtemp(prefix='demucs_')
         success = False
@@ -391,6 +392,7 @@ class VideoTranslator:
             demucs_log_path = Path(tmp_dir) / 'demucs.log'
             env.setdefault('PYTHONUNBUFFERED', '1')
 
+            is_tty = sys.stdout.isatty()
             percent_re = re.compile(r'(\d{1,3})%')
             last_percent = None
             next_log_percent = 10
@@ -401,7 +403,7 @@ class VideoTranslator:
             log_buf = ''
 
             def _print_progress(text: str):
-                if not sys.stdout.isatty():
+                if not is_tty:
                     return
                 sys.stdout.write(text)
                 sys.stdout.flush()
@@ -449,8 +451,8 @@ class VideoTranslator:
                         bar = '#' * filled + '.' * (bar_len - filled)
                         _print_progress(f"\r    [Demucs] {last_percent:3d}% |{bar}| {elapsed}s")
 
-                        # 记录到日志文件（每10%一次），方便后台查看
-                        if last_percent >= next_log_percent:
+                        # notebook/非TTY：每10%记录一次，避免刷屏
+                        if (not is_tty) and last_percent >= next_log_percent:
                             logging.info(f"    [Demucs] 进度: {last_percent}%")
                             next_log_percent += 10
                     else:
@@ -463,7 +465,7 @@ class VideoTranslator:
 
                 proc.wait()
 
-            if sys.stdout.isatty():
+            if is_tty:
                 # 清理进度行
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -484,6 +486,8 @@ class VideoTranslator:
                     tail = "\n".join(tail_text.splitlines()[-200:])
                     logging.error("  × Demucs 输出（最后200行）：\n" + tail)
                 logging.error(f"  ! Demucs 日志文件: {demucs_log_path}")
+                if 'TorchCodec is required' in tail_text or "No module named 'torchcodec'" in tail_text:
+                    raise RuntimeError("Demucs 依赖 torchcodec 保存音频：请先运行 `pip install torchcodec` 再重试") from None
                 raise RuntimeError(f"Demucs 执行失败（exit code={proc.returncode}）: {' '.join(cmd)}")
 
             tmp_dir_path = Path(tmp_dir)
