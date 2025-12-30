@@ -18,6 +18,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import subprocess
+import shutil
 
 # 解决Windows终端编码问题
 if sys.platform == 'win32':
@@ -376,7 +377,9 @@ class VideoTranslator:
             # 尽量减少显存碎片导致的 OOM（不覆盖用户已有设置）
             env.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'max_split_size_mb:128')
 
-        with tempfile.TemporaryDirectory(prefix='demucs_') as tmp_dir:
+        tmp_dir = tempfile.mkdtemp(prefix='demucs_')
+        success = False
+        try:
             cmd = [
                 sys.executable, '-m', 'demucs.separate',
                 '-n', self.vocal_separation_model,
@@ -384,7 +387,19 @@ class VideoTranslator:
                 '-o', tmp_dir,
                 str(input_audio_path)
             ]
-            subprocess.run(cmd, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.run(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if proc.returncode != 0:
+                out = (proc.stdout or '').strip()
+                if out:
+                    tail = "\n".join(out.splitlines()[-200:])
+                    logging.error("  × Demucs 输出（最后200行）：\n" + tail)
+                raise RuntimeError(f"Demucs 执行失败（exit code={proc.returncode}）: {' '.join(cmd)}")
 
             tmp_dir_path = Path(tmp_dir)
             candidates = list(tmp_dir_path.rglob('vocals.wav'))
@@ -403,6 +418,12 @@ class VideoTranslator:
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if not output_wav_path.exists():
                 raise FileNotFoundError(f"人声分离输出未生成: {output_wav_path}")
+            success = True
+        finally:
+            if success:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            else:
+                logging.error(f"  ! Demucs 临时目录已保留用于排查: {tmp_dir}")
 
     def transcribe(self, audio_path):
         """语音识别"""
