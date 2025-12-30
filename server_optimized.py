@@ -41,7 +41,7 @@ TOKENIZER = None
 # Defaults are populated in __main__ (and used by /models/load when payload omits fields)
 SERVICE_CONFIG = {
     'asr_model_size': 'medium',
-    'translation_model': 'facebook/nllb-200-distilled-1.3B',
+    'translation_model': 'facebook/nllb-200-1.3B',
     'use_gpu': True,
     'device': 'cuda' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu',
     'compute_type': 'float16' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'int8',
@@ -223,7 +223,7 @@ def init_models():
     global LOADING_THREAD, LOADING_PARAMS
     payload = request.json or {}
     asr_size = payload.get('asr_model_size', 'medium')
-    translation_name = payload.get('translation_model', 'facebook/nllb-200-distilled-600M')
+    translation_name = payload.get('translation_model', 'facebook/nllb-200-1.3B')
     want_gpu = payload.get('use_gpu', True)
     device = 'cuda' if want_gpu and _torch_cuda_available() else 'cpu'
     compute_type = payload.get('compute_type', 'float16' if device == 'cuda' else 'int8')
@@ -278,7 +278,7 @@ def models_load():
         return jsonify({'success': False, 'error': 'No models requested'}), 400
 
     asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'medium')
-    translation_name = payload.get('translation_model') or payload.get('translation_name') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-distilled-1.3B')
+    translation_name = payload.get('translation_model') or payload.get('translation_name') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-1.3B')
     want_gpu = payload.get('use_gpu')
     if want_gpu is None:
         want_gpu = SERVICE_CONFIG.get('use_gpu', True)
@@ -626,7 +626,7 @@ if __name__ == '__main__':
     default_host = getattr(app_config, 'service_host', '127.0.0.1')
     default_port = getattr(app_config, 'service_port', 50515)
     default_asr_model_size = getattr(app_config, 'asr_model_size', 'medium')
-    default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-distilled-1.3B')
+    default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-1.3B')
     default_use_gpu = getattr(app_config, 'use_gpu', True)
     default_lazy_load = getattr(app_config, 'lazy_load_models', False)
 

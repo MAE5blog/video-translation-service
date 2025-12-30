@@ -77,7 +77,7 @@ unload_models_after_tasks = false
 
 [Models]
 asr_model_size = medium
-translation_model = facebook/nllb-200-distilled-1.3B
+translation_model = facebook/nllb-200-1.3B
 use_gpu = true
 beam_size = 3
 
@@ -240,7 +240,7 @@ asr_model_size = medium
 # 翻译模型
 # 推荐: facebook/nllb-200-distilled-1.3B（高质量）
 # 可选: facebook/nllb-200-distilled-600M（更快）
-translation_model = facebook/nllb-200-distilled-1.3B
+translation_model = facebook/nllb-200-1.3B
 
 # 使用GPU
 use_gpu = true
