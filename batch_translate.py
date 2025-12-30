@@ -278,7 +278,8 @@ class VideoTranslator:
                 logging.error(f"  × 等待模型加载超时（{timeout}秒）")
                 return False
             try:
-                h = requests.get(f"{self.service_url}/health", timeout=5).json()
+                # 模型首次下载/加载时，服务端可能短暂无响应（GIL/IO/CPU占用），适当放宽 read timeout
+                h = requests.get(f"{self.service_url}/health", timeout=(3, 30)).json()
             except Exception as e:
                 if time.time() - last_log >= 10:
                     logging.info(f"    … 等待服务响应: {e}")
