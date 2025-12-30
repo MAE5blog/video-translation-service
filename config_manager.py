@@ -146,6 +146,31 @@ class Config:
         v = (self.get('Subtitles', 'format', 'srt') or 'srt').strip().lower()
         return v if v in ('srt', 'ass') else 'srt'
 
+    @property
+    def subtitle_fix_linger(self):
+        """是否自动修复字幕滞留（压缩异常过长的结束时间）"""
+        return self.get_bool('Subtitles', 'fix_linger', True)
+
+    @property
+    def subtitle_min_duration_sec(self):
+        """字幕最短显示时长（秒）"""
+        return self.get_float('Subtitles', 'min_duration_sec', 1.2)
+
+    @property
+    def subtitle_max_duration_sec(self):
+        """字幕最长显示时长（秒），用于避免长静音导致的“字幕滞留”"""
+        return self.get_float('Subtitles', 'max_duration_sec', 12.0)
+
+    @property
+    def subtitle_chars_per_sec(self):
+        """估算阅读速度：每秒字符数（中文建议 8~12）"""
+        return self.get_float('Subtitles', 'chars_per_sec', 8.0)
+
+    @property
+    def subtitle_linger_slack_sec(self):
+        """超过“可读时长 + slack”才收缩 end（秒），避免过度干预"""
+        return self.get_float('Subtitles', 'linger_slack_sec', 0.5)
+
     # 音频预处理
     @property
     def enable_vocal_separation(self):

@@ -159,6 +159,32 @@ class VideoTranslator:
         if self.subtitle_format not in ('srt', 'ass'):
             self.subtitle_format = 'srt'
 
+        # 字幕时间轴修复：避免“一句话结束后字幕一直停留到下一句”
+        if CONFIG_AVAILABLE:
+            self.subtitle_fix_linger = bool(getattr(config, 'subtitle_fix_linger', True))
+            self.subtitle_min_duration_sec = float(getattr(config, 'subtitle_min_duration_sec', 1.2) or 1.2)
+            self.subtitle_max_duration_sec = float(getattr(config, 'subtitle_max_duration_sec', 12.0) or 12.0)
+            self.subtitle_chars_per_sec = float(getattr(config, 'subtitle_chars_per_sec', 8.0) or 8.0)
+            self.subtitle_linger_slack_sec = float(getattr(config, 'subtitle_linger_slack_sec', 0.5) or 0.5)
+        else:
+            self.subtitle_fix_linger = True
+            self.subtitle_min_duration_sec = 1.2
+            self.subtitle_max_duration_sec = 12.0
+            self.subtitle_chars_per_sec = 8.0
+            self.subtitle_linger_slack_sec = 0.5
+
+        # 参数兜底/保护
+        if not (self.subtitle_min_duration_sec > 0):
+            self.subtitle_min_duration_sec = 1.2
+        if not (self.subtitle_max_duration_sec > 0):
+            self.subtitle_max_duration_sec = 12.0
+        if self.subtitle_max_duration_sec < self.subtitle_min_duration_sec:
+            self.subtitle_max_duration_sec = self.subtitle_min_duration_sec
+        if not (self.subtitle_chars_per_sec > 0):
+            self.subtitle_chars_per_sec = 8.0
+        if self.subtitle_linger_slack_sec < 0:
+            self.subtitle_linger_slack_sec = 0.0
+
         # 线程池用于并发润色
         if self.use_polish:
             self.polish_executor = ThreadPoolExecutor(max_workers=concurrent_polish)
@@ -1256,6 +1282,94 @@ class VideoTranslator:
         return f"{h:d}:{m:02d}:{s:02d}.{cs:02d}"
 
     @staticmethod
+    def _subtitle_char_count(text: str) -> int:
+        """统计用于估算阅读时长的“可见字符数”（去空白）。"""
+        text = '' if text is None else str(text)
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        text = text.replace('\n', ' ')
+        text = re.sub(r'\s+', '', text)
+        return len(text)
+
+    def _prepare_subtitle_segments(self, segments, translation_only: bool):
+        """
+        为字幕输出准备 segments：
+        - 保证 start/end 为 float 且 end > start
+        - 可选：修复“滞留”——当 end 明显过长时按可读时长收缩
+        """
+        if not segments:
+            return []
+
+        items = []
+        for seg in segments:
+            try:
+                start = float(seg.get('start', 0.0) or 0.0)
+            except Exception:
+                start = 0.0
+            try:
+                end = float(seg.get('end', start) or start)
+            except Exception:
+                end = start
+            if start < 0:
+                start = 0.0
+            if end < start:
+                end = start
+            items.append((start, end, seg))
+
+        items.sort(key=lambda x: x[0])
+
+        min_dur = float(self.subtitle_min_duration_sec or 1.2)
+        max_dur = float(self.subtitle_max_duration_sec or 12.0)
+        cps = float(self.subtitle_chars_per_sec or 8.0)
+        slack = float(self.subtitle_linger_slack_sec or 0.5)
+        if min_dur <= 0:
+            min_dur = 1.2
+        if max_dur < min_dur:
+            max_dur = min_dur
+        if cps <= 0:
+            cps = 8.0
+        if slack < 0:
+            slack = 0.0
+
+        out = []
+        total = len(items)
+        for idx, (start, end, seg) in enumerate(items):
+            # 保障最小时长，避免 0 长度导致播放器行为异常
+            if end <= start + 0.02:
+                end = start + 0.02
+
+            if self.subtitle_fix_linger:
+                if translation_only:
+                    show_text = seg.get('translated', seg.get('text', '')) or ''
+                    char_count = self._subtitle_char_count(show_text)
+                else:
+                    a = seg.get('text', '') or ''
+                    b = seg.get('translated', a) or a
+                    char_count = self._subtitle_char_count(a) + self._subtitle_char_count(b)
+
+                ideal = (char_count / cps) if char_count > 0 else min_dur
+                if ideal < min_dur:
+                    ideal = min_dur
+                if ideal > max_dur:
+                    ideal = max_dur
+
+                dur = end - start
+                if dur > ideal + slack:
+                    end = start + ideal
+
+            # 不与下一条重叠（留一点点间隙）
+            if idx + 1 < total:
+                next_start = float(items[idx + 1][0])
+                if end > next_start - 0.01:
+                    end = max(start + 0.02, next_start - 0.01)
+
+            seg2 = dict(seg)
+            seg2['start'] = start
+            seg2['end'] = end
+            out.append(seg2)
+
+        return out
+
+    @staticmethod
     def _ass_escape(text: str) -> str:
         """ASS 文本转义：换行->\\N，避免花括号被当作样式标签。"""
         text = '' if text is None else str(text)
@@ -1303,6 +1417,7 @@ class VideoTranslator:
     def generate_srt(self, segments, output_path, translation_only=False):
         """生成SRT字幕文件"""
         try:
+            segments = self._prepare_subtitle_segments(segments, translation_only)
             with open(output_path, 'w', encoding='utf-8') as f:
                 for i, seg in enumerate(segments, 1):
                     start = self.format_time(seg['start'])
@@ -1327,6 +1442,7 @@ class VideoTranslator:
     def generate_ass(self, segments, output_path, translation_only=False, video_path: Path | None = None):
         """生成 ASS 字幕文件（V4+）。"""
         try:
+            segments = self._prepare_subtitle_segments(segments, translation_only)
             w, h = (None, None)
             if video_path is not None:
                 w, h = self._probe_video_resolution(video_path)
