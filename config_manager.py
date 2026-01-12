@@ -140,6 +140,42 @@ class Config:
         """Transformers ASR 分块重叠秒数（仅对 transformers 后端生效）"""
         return self.get_float('ASR', 'transformers_stride_sec', 5.0)
 
+    # GGUF/llama.cpp 配置
+    @property
+    def gguf_n_ctx(self):
+        """GGUF 上下文长度"""
+        return self.get_int('GGUF', 'n_ctx', 4096)
+
+    @property
+    def gguf_n_threads(self):
+        """GGUF 线程数"""
+        return self.get_int('GGUF', 'n_threads', 4)
+
+    @property
+    def gguf_n_batch(self):
+        """GGUF batch 大小"""
+        return self.get_int('GGUF', 'n_batch', 256)
+
+    @property
+    def gguf_n_gpu_layers(self):
+        """GGUF GPU层数（-1=全层，0=CPU）"""
+        return self.get_int('GGUF', 'n_gpu_layers', -1)
+
+    @property
+    def gguf_temperature(self):
+        """GGUF 采样温度"""
+        return self.get_float('GGUF', 'temperature', 0.1)
+
+    @property
+    def gguf_top_p(self):
+        """GGUF top_p"""
+        return self.get_float('GGUF', 'top_p', 0.9)
+
+    @property
+    def gguf_repeat_penalty(self):
+        """GGUF repeat_penalty"""
+        return self.get_float('GGUF', 'repeat_penalty', 1.05)
+
     # 翻译配置
     @property
     def default_target_language(self):

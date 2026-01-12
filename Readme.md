@@ -80,6 +80,7 @@ unload_models_after_tasks = false
 # reazonspeech 为日语优化模型（transformers 后端）；如需自定义，可用 reazonspeech:HF模型名
 asr_model_size = reazonspeech
 translation_model = SakuraLLM/Sakura-4B-Qwen3-Base-v2
+# GGUF 用法：translation_model = gguf:/path/to/model.gguf
 use_gpu = true
 beam_size = 3
 
@@ -251,6 +252,7 @@ asr_model_size = reazonspeech
 # 翻译模型
 # 推荐: SakuraLLM/Sakura-4B-Qwen3-Base-v2（日->中更好，显存占用较低）
 # 备选: facebook/nllb-200-distilled-1.3B（高质量）
+# GGUF 用法：gguf:/path/to/model.gguf 或 gguf:hf:repo_id@filename.gguf
 translation_model = SakuraLLM/Sakura-4B-Qwen3-Base-v2
 
 # 使用GPU
@@ -297,7 +299,19 @@ format = srt
 | nllb-200-distilled-1.3B | 1.3B | 中等 | 高 | 通用 |
 | m2m100_418M | 418M | 很快 | 可用 | 极速 |
 
-注：Sakura LLM 为日->中翻译模型（CausalLM），显存占用更高；如显存不足可改用 NLLB 系列。
+注：Sakura LLM 为日->中翻译模型（CausalLM），显存占用较高；如显存不足可改用 NLLB 系列。
+
+#### GGUF（llama.cpp）翻译
+
+- 适合使用量化 GGUF 模型节省显存
+- 需要额外安装：`pip install llama-cpp-python`（GPU 可用 cuBLAS 版本，例如：`CMAKE_ARGS="-DLLAMA_CUBLAS=on" pip install llama-cpp-python`）
+- 设置示例：
+  ```
+  translation_model = gguf:/path/to/model.gguf
+  # 或从 HF 下载：
+  # translation_model = gguf:hf:repo_id@filename.gguf
+  ```
+  如果模型是 gated，请设置 `HF_TOKEN` 环境变量
 
 ## 💡 DeepSeek 润色
 
@@ -417,7 +431,8 @@ video-translation-service/
 └── models/                     # 模型目录（自动下载）
     ├── whisper/                # ASR模型
     ├── nllb/                   # 翻译模型
-    └── sakura/                 # Sakura LLM 模型
+    ├── sakura/                 # Sakura LLM 模型
+    └── gguf/                   # GGUF 模型
 ```
 
 ## 🔧 进度管理

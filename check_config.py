@@ -110,6 +110,35 @@ class Config:
         """Transformers ASR 分块重叠秒数（仅对 transformers 后端生效）"""
         return self.get_float('ASR', 'transformers_stride_sec', 5.0)
 
+    # GGUF/llama.cpp 配置
+    @property
+    def gguf_n_ctx(self):
+        return self.get_int('GGUF', 'n_ctx', 4096)
+
+    @property
+    def gguf_n_threads(self):
+        return self.get_int('GGUF', 'n_threads', 4)
+
+    @property
+    def gguf_n_batch(self):
+        return self.get_int('GGUF', 'n_batch', 256)
+
+    @property
+    def gguf_n_gpu_layers(self):
+        return self.get_int('GGUF', 'n_gpu_layers', -1)
+
+    @property
+    def gguf_temperature(self):
+        return self.get_float('GGUF', 'temperature', 0.1)
+
+    @property
+    def gguf_top_p(self):
+        return self.get_float('GGUF', 'top_p', 0.9)
+
+    @property
+    def gguf_repeat_penalty(self):
+        return self.get_float('GGUF', 'repeat_penalty', 1.05)
+
     # 翻译配置
     @property
     def default_target_language(self):
@@ -151,6 +180,13 @@ if __name__ == '__main__':
     print(f"GPU任务前清理显存缓存: {config.clear_cuda_cache_before_tasks}")
     print(f"ASR transformers 分块秒数: {config.asr_transformers_chunk_sec}")
     print(f"ASR transformers 分块重叠秒数: {config.asr_transformers_stride_sec}")
+    print(f"GGUF n_ctx: {config.gguf_n_ctx}")
+    print(f"GGUF n_threads: {config.gguf_n_threads}")
+    print(f"GGUF n_batch: {config.gguf_n_batch}")
+    print(f"GGUF n_gpu_layers: {config.gguf_n_gpu_layers}")
+    print(f"GGUF temperature: {config.gguf_temperature}")
+    print(f"GGUF top_p: {config.gguf_top_p}")
+    print(f"GGUF repeat_penalty: {config.gguf_repeat_penalty}")
     print(f"默认目标语言: {config.default_target_language}")
     print(f"使用DeepSeek润色: {config.use_deepseek_polish}")
     print(f"启用人声分离: {config.enable_vocal_separation}")

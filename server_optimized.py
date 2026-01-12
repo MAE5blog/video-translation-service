@@ -33,6 +33,14 @@ except ImportError:
     AutoProcessor = None
     pipeline = None
     torch = None
+try:
+    from llama_cpp import Llama
+except ImportError:
+    Llama = None
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:
+    hf_hub_download = None
 
 app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = './uploads'
@@ -56,6 +64,13 @@ SERVICE_CONFIG = {
     'compute_type': 'float16' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'int8',
     'asr_transformers_chunk_sec': 30,
     'asr_transformers_stride_sec': 5.0,
+    'gguf_n_ctx': 4096,
+    'gguf_n_threads': 4,
+    'gguf_n_batch': 256,
+    'gguf_n_gpu_layers': -1,
+    'gguf_temperature': 0.1,
+    'gguf_top_p': 0.9,
+    'gguf_repeat_penalty': 1.05,
 }
 
 DEFAULT_REAZON_ASR_MODEL = 'japanese-asr/distil-whisper-large-v3-ja-reazonspeech-large'
@@ -74,6 +89,65 @@ def _resolve_asr_backend(asr_size: str) -> tuple[str, str]:
         return 'transformers', DEFAULT_REAZON_ASR_MODEL
     return 'faster-whisper', raw
 
+
+def _is_gguf_model(model_name: str | None) -> bool:
+    if not model_name:
+        return False
+    name = model_name.strip().lower()
+    return name.startswith('gguf:') or name.endswith('.gguf')
+
+
+def _resolve_gguf_model_path(model_name: str) -> str:
+    """解析 GGUF 模型路径：gguf:/path 或 gguf:hf:repo@file。"""
+    raw = model_name.strip()
+    if raw.lower().startswith('gguf:'):
+        raw = raw.split(':', 1)[1].strip()
+    if raw.lower().startswith('hf:'):
+        raw = raw.split(':', 1)[1].strip()
+
+    if '@' in raw:
+        if not hf_hub_download:
+            raise ImportError('huggingface_hub not installed (required for gguf:hf:repo@file)')
+        repo_id, filename = raw.split('@', 1)
+        token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_HUB_TOKEN')
+        return hf_hub_download(
+            repo_id=repo_id.strip(),
+            filename=filename.strip(),
+            token=token,
+            cache_dir='./models/gguf'
+        )
+
+    model_path = os.path.abspath(raw)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f'GGUF model not found: {model_path}')
+    return model_path
+
+
+def _get_gguf_settings(device: str) -> dict:
+    try:
+        n_ctx = int(SERVICE_CONFIG.get('gguf_n_ctx', 4096) or 4096)
+    except Exception:
+        n_ctx = 4096
+    try:
+        n_threads = int(SERVICE_CONFIG.get('gguf_n_threads', 4) or 4)
+    except Exception:
+        n_threads = 4
+    try:
+        n_batch = int(SERVICE_CONFIG.get('gguf_n_batch', 256) or 256)
+    except Exception:
+        n_batch = 256
+    try:
+        n_gpu_layers = int(SERVICE_CONFIG.get('gguf_n_gpu_layers', -1) or -1)
+    except Exception:
+        n_gpu_layers = -1
+    if device != 'cuda':
+        n_gpu_layers = 0
+    return {
+        'n_ctx': n_ctx,
+        'n_threads': n_threads,
+        'n_batch': n_batch,
+        'n_gpu_layers': n_gpu_layers,
+    }
 
 def _get_transformers_chunk_settings() -> tuple[float, float] | None:
     """获取 transformers ASR 内部分块配置（<=0 表示禁用）。"""
@@ -205,17 +279,30 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
                 return
         elif load_asr and ASR_READY:
             _set_status('asr_ready', max(STATUS['progress'], 0.35), 'ASR already ready.')
-        # Translation model - 使用 Sakura LLM / m2m100 / NLLB
+        # Translation model - 使用 GGUF / Sakura LLM / m2m100 / NLLB
         if load_translation and not TRANSLATION_READY:
             # 检测模型类型
             translation_lower = (translation_name or '').lower()
-            is_m2m100 = 'm2m100' in translation_lower
-            is_sakura = 'sakura' in translation_lower
-            TRANSLATION_BACKEND = 'sakura' if is_sakura else ('m2m100' if is_m2m100 else 'nllb')
+            is_gguf = _is_gguf_model(translation_name)
+            is_m2m100 = (not is_gguf) and ('m2m100' in translation_lower)
+            is_sakura = (not is_gguf) and ('sakura' in translation_lower)
+            TRANSLATION_BACKEND = 'gguf' if is_gguf else ('sakura' if is_sakura else ('m2m100' if is_m2m100 else 'nllb'))
             TRANSLATION_MODEL_NAME = translation_name
             _set_status('translation_downloading', 0.4, f'Downloading translation model {translation_name} ...')
             try:
-                if is_sakura and AutoTokenizer and AutoModelForCausalLM and torch:
+                if is_gguf:
+                    if not Llama:
+                        raise ImportError('llama_cpp is required for GGUF translation')
+                    model_path = _resolve_gguf_model_path(translation_name)
+                    settings = _get_gguf_settings(device)
+                    _set_status('translation_loading', 0.55, f'Loading GGUF model {os.path.basename(model_path)} ...')
+                    TRANSLATION_MODEL = Llama(
+                        model_path=model_path,
+                        **settings
+                    )
+                    TRANSLATION_MODEL_NAME = model_path
+                    TOKENIZER = None
+                elif is_sakura and AutoTokenizer and AutoModelForCausalLM and torch:
                     print(f'[Translation] Using Sakura LLM model: {translation_name}')
                     TOKENIZER = AutoTokenizer.from_pretrained(
                         translation_name,
@@ -248,7 +335,7 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
                 else:
                     raise ImportError('No translation library available')
                     
-                if torch and device == 'cuda':
+                if torch and device == 'cuda' and TRANSLATION_BACKEND != 'gguf':
                     TRANSLATION_MODEL = TRANSLATION_MODEL.to(device)
                     TRANSLATION_MODEL.eval()
                 TRANSLATION_READY = True
@@ -374,7 +461,7 @@ def models_load():
         return jsonify({'success': False, 'error': 'Invalid models'}), 400
 
     want_asr = any(str(m).lower() in ('asr', 'whisper') for m in models)
-    want_translation = any(str(m).lower() in ('translation', 'translate', 'nllb', 'm2m100') for m in models)
+    want_translation = any(str(m).lower() in ('translation', 'translate', 'nllb', 'm2m100', 'sakura', 'gguf', 'llama') for m in models)
     if not want_asr and not want_translation:
         return jsonify({'success': False, 'error': 'No models requested'}), 400
 
@@ -432,7 +519,7 @@ def models_unload():
 
     want_all = any(str(m).lower() in ('all', '*') for m in models)
     unload_asr = want_all or any(str(m).lower() in ('asr', 'whisper') for m in models)
-    unload_translation = want_all or any(str(m).lower() in ('translation', 'translate', 'nllb', 'm2m100') for m in models)
+    unload_translation = want_all or any(str(m).lower() in ('translation', 'translate', 'nllb', 'm2m100', 'sakura', 'gguf', 'llama') for m in models)
 
     with MODEL_LOCK:
         if unload_asr:
@@ -617,7 +704,7 @@ def _lang_display_name(code: str | None) -> str:
     return _LANG_NAME_MAP.get(norm, norm or '原文')
 
 
-def _build_sakura_prompt(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
+def _build_llm_prompt(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
     src_name = _lang_display_name(src_lang)
     tgt_name = _lang_display_name(tgt_lang)
     return (
@@ -628,7 +715,7 @@ def _build_sakura_prompt(text: str, src_lang: str | None, tgt_lang: str | None) 
 
 
 def _translate_with_sakura(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
-    prompt = _build_sakura_prompt(text, src_lang, tgt_lang)
+    prompt = _build_llm_prompt(text, src_lang, tgt_lang)
     inputs = TOKENIZER(prompt, return_tensors='pt')
     if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
         inputs = {k: v.to('cuda') for k, v in inputs.items()}
@@ -651,7 +738,32 @@ def _translate_with_sakura(text: str, src_lang: str | None, tgt_lang: str | None
     return translated
 
 
+def _translate_with_gguf(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
+    prompt = _build_llm_prompt(text, src_lang, tgt_lang)
+    max_tokens = min(512, max(64, len(text) * 2))
+    temperature = float(SERVICE_CONFIG.get('gguf_temperature', 0.1) or 0.1)
+    top_p = float(SERVICE_CONFIG.get('gguf_top_p', 0.9) or 0.9)
+    repeat_penalty = float(SERVICE_CONFIG.get('gguf_repeat_penalty', 1.05) or 1.05)
+    result = TRANSLATION_MODEL(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        repeat_penalty=repeat_penalty,
+        stop=["</s>", "<|eot_id|>"]
+    )
+    text_out = (result.get('choices') or [{}])[0].get('text') or ''
+    translated = text_out.strip()
+    for prefix in ('译文：', '译文:', 'Translation:', '翻译：'):
+        if translated.startswith(prefix):
+            translated = translated[len(prefix):].strip()
+            break
+    return translated
+
+
 def _translate_text_internal(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
+    if TRANSLATION_BACKEND == 'gguf':
+        return _translate_with_gguf(text, src_lang, tgt_lang)
     if TRANSLATION_BACKEND == 'sakura':
         return _translate_with_sakura(text, src_lang, tgt_lang)
 
@@ -777,6 +889,13 @@ if __name__ == '__main__':
     default_lazy_load = getattr(app_config, 'lazy_load_models', False)
     default_asr_transformers_chunk_sec = getattr(app_config, 'asr_transformers_chunk_sec', 30)
     default_asr_transformers_stride_sec = getattr(app_config, 'asr_transformers_stride_sec', 5.0)
+    default_gguf_n_ctx = getattr(app_config, 'gguf_n_ctx', 4096)
+    default_gguf_n_threads = getattr(app_config, 'gguf_n_threads', 4)
+    default_gguf_n_batch = getattr(app_config, 'gguf_n_batch', 256)
+    default_gguf_n_gpu_layers = getattr(app_config, 'gguf_n_gpu_layers', -1)
+    default_gguf_temperature = getattr(app_config, 'gguf_temperature', 0.1)
+    default_gguf_top_p = getattr(app_config, 'gguf_top_p', 0.9)
+    default_gguf_repeat_penalty = getattr(app_config, 'gguf_repeat_penalty', 1.05)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default=default_host)
@@ -825,6 +944,13 @@ if __name__ == '__main__':
             'compute_type': compute_type,
             'asr_transformers_chunk_sec': default_asr_transformers_chunk_sec,
             'asr_transformers_stride_sec': default_asr_transformers_stride_sec,
+            'gguf_n_ctx': default_gguf_n_ctx,
+            'gguf_n_threads': default_gguf_n_threads,
+            'gguf_n_batch': default_gguf_n_batch,
+            'gguf_n_gpu_layers': default_gguf_n_gpu_layers,
+            'gguf_temperature': default_gguf_temperature,
+            'gguf_top_p': default_gguf_top_p,
+            'gguf_repeat_penalty': default_gguf_repeat_penalty,
         })
     except Exception:
         pass
