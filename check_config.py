@@ -83,7 +83,7 @@ class Config:
 
     @property
     def translation_model(self):
-        return self.get('Models', 'translation_model', 'SakuraLLM/Sakura-4B-Qwen3-Base-v2')
+        return self.get('Models', 'translation_model', 'gguf:hf:SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF@sakura-7b-qwen2.5-v1.0-iq4xs.gguf')
 
     @property
     def use_gpu(self):

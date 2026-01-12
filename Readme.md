@@ -79,7 +79,7 @@ unload_models_after_tasks = false
 # ASR模型大小: tiny, base, small, medium, large-v3, reazonspeech
 # reazonspeech 为日语优化模型（transformers 后端）；如需自定义，可用 reazonspeech:HF模型名
 asr_model_size = reazonspeech
-translation_model = SakuraLLM/Sakura-4B-Qwen3-Base-v2
+translation_model = gguf:hf:SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF@sakura-7b-qwen2.5-v1.0-iq4xs.gguf
 # GGUF 用法：translation_model = gguf:/path/to/model.gguf
 use_gpu = true
 beam_size = 3
@@ -250,10 +250,11 @@ port = 50515
 asr_model_size = reazonspeech
 
 # 翻译模型
-# 推荐: SakuraLLM/Sakura-4B-Qwen3-Base-v2（日->中更好，显存占用较低）
+# 推荐: GGUF 量化（节省显存，T4 友好）
+# 备选: SakuraLLM/Sakura-4B-Qwen3-Base-v2（日->中更好）
 # 备选: facebook/nllb-200-distilled-1.3B（高质量）
 # GGUF 用法：gguf:/path/to/model.gguf 或 gguf:hf:repo_id@filename.gguf
-translation_model = SakuraLLM/Sakura-4B-Qwen3-Base-v2
+translation_model = gguf:hf:SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF@sakura-7b-qwen2.5-v1.0-iq4xs.gguf
 
 # 使用GPU
 use_gpu = true
@@ -294,12 +295,12 @@ format = srt
 
 | 模型 | 大小 | 速度 | 质量 | 推荐 |
 |------|------|------|------|------|
-| SakuraLLM/Sakura-4B-Qwen3-Base-v2 | 4B | 中等 | 高 | 日->中 |
+| Sakura-7B-Qwen2.5 (GGUF iq4xs) | 7B | 中等 | 高 | T4 友好 |
 | nllb-200-distilled-600M | 600M | 快 | 良好 | 快速 |
 | nllb-200-distilled-1.3B | 1.3B | 中等 | 高 | 通用 |
 | m2m100_418M | 418M | 很快 | 可用 | 极速 |
 
-注：Sakura LLM 为日->中翻译模型（CausalLM），显存占用较高；如显存不足可改用 NLLB 系列。
+注：Sakura LLM 为日->中翻译模型（CausalLM），显存占用较高；如显存不足可改用 GGUF 量化或 NLLB 系列。
 
 #### GGUF（llama.cpp）翻译
 

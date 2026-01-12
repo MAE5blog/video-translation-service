@@ -130,7 +130,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--translation-model",
-        default="SakuraLLM/Sakura-4B-Qwen3-Base-v2",
+        default="gguf:hf:SakuraLLM/Sakura-7B-Qwen2.5-v1.0-GGUF@sakura-7b-qwen2.5-v1.0-iq4xs.gguf",
         help="Translation model for /init",
     )
     parser.add_argument("--use-gpu", action="store_true", help="Request GPU in /init (if available)")
