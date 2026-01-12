@@ -130,7 +130,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--translation-model",
-        default="facebook/nllb-200-distilled-1.3B",
+        default="SakuraLLM/Sakura-7B",
         help="Translation model for /init",
     )
     parser.add_argument("--use-gpu", action="store_true", help="Request GPU in /init (if available)")

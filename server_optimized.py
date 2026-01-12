@@ -20,12 +20,13 @@ try:
 except ImportError:
     WhisperModel = None
 try:
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, M2M100ForConditionalGeneration, M2M100Tokenizer
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, M2M100ForConditionalGeneration, M2M100Tokenizer
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
     import torch
 except ImportError:
     AutoTokenizer = None
     AutoModelForSeq2SeqLM = None
+    AutoModelForCausalLM = None
     M2M100ForConditionalGeneration = None
     M2M100Tokenizer = None
     AutoModelForSpeechSeq2Seq = None
@@ -43,11 +44,13 @@ ASR_BACKEND = 'faster-whisper'
 ASR_MODEL_NAME = None
 TRANSLATION_MODEL = None
 TOKENIZER = None
+TRANSLATION_BACKEND = 'nllb'
+TRANSLATION_MODEL_NAME = None
 
 # Defaults are populated in __main__ (and used by /models/load when payload omits fields)
 SERVICE_CONFIG = {
     'asr_model_size': 'reazonspeech',
-    'translation_model': 'facebook/nllb-200-1.3B',
+    'translation_model': 'SakuraLLM/Sakura-7B',
     'use_gpu': True,
     'device': 'cuda' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu',
     'compute_type': 'float16' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'int8',
@@ -157,7 +160,7 @@ def _set_error(err_msg: str):
 def _load_models_async(asr_size: str, translation_name: str, device: str, compute_type: str,
                        load_asr: bool = True, load_translation: bool = True):
     """Background thread target to load models with phase updates."""
-    global ASR_MODEL, ASR_BACKEND, ASR_MODEL_NAME, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY, LOADING_THREAD
+    global ASR_MODEL, ASR_BACKEND, ASR_MODEL_NAME, TRANSLATION_MODEL, TOKENIZER, TRANSLATION_BACKEND, TRANSLATION_MODEL_NAME, ASR_READY, TRANSLATION_READY, LOADING_THREAD
     try:
         if STATUS['started_at'] is None:
             STATUS['started_at'] = time.time()
@@ -202,13 +205,37 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
                 return
         elif load_asr and ASR_READY:
             _set_status('asr_ready', max(STATUS['progress'], 0.35), 'ASR already ready.')
-        # Translation model - 使用m2m100或NLLB
+        # Translation model - 使用 Sakura LLM / m2m100 / NLLB
         if load_translation and not TRANSLATION_READY:
-            # 检测是否是m2m100模型
-            is_m2m100 = 'm2m100' in translation_name.lower()
+            # 检测模型类型
+            translation_lower = (translation_name or '').lower()
+            is_m2m100 = 'm2m100' in translation_lower
+            is_sakura = 'sakura' in translation_lower
+            TRANSLATION_BACKEND = 'sakura' if is_sakura else ('m2m100' if is_m2m100 else 'nllb')
+            TRANSLATION_MODEL_NAME = translation_name
             _set_status('translation_downloading', 0.4, f'Downloading translation model {translation_name} ...')
             try:
-                if is_m2m100 and M2M100Tokenizer and M2M100ForConditionalGeneration:
+                if is_sakura and AutoTokenizer and AutoModelForCausalLM and torch:
+                    print(f'[Translation] Using Sakura LLM model: {translation_name}')
+                    TOKENIZER = AutoTokenizer.from_pretrained(
+                        translation_name,
+                        cache_dir='./models/sakura',
+                        trust_remote_code=True
+                    )
+                    _set_status('translation_loading', 0.55, f'Loading translation model {translation_name} (sakura) ...')
+                    dtype = torch.float16 if device == 'cuda' else torch.float32
+                    TRANSLATION_MODEL = AutoModelForCausalLM.from_pretrained(
+                        translation_name,
+                        cache_dir='./models/sakura',
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                        trust_remote_code=True
+                    )
+                    if TOKENIZER.pad_token_id is None:
+                        TOKENIZER.pad_token = TOKENIZER.eos_token or TOKENIZER.unk_token
+                    if getattr(TRANSLATION_MODEL, 'config', None) and TRANSLATION_MODEL.config.pad_token_id is None:
+                        TRANSLATION_MODEL.config.pad_token_id = TOKENIZER.pad_token_id
+                elif is_m2m100 and M2M100Tokenizer and M2M100ForConditionalGeneration:
                     print(f'[Translation] Using M2M100 model: {translation_name}')
                     TOKENIZER = M2M100Tokenizer.from_pretrained(translation_name, cache_dir='./models/m2m100')
                     _set_status('translation_loading', 0.55, f'Loading translation model {translation_name} ...')
@@ -250,6 +277,8 @@ def health():
         'translation_ready': TRANSLATION_READY,
         'asr_backend': ASR_BACKEND,
         'asr_model': ASR_MODEL_NAME,
+        'translation_backend': TRANSLATION_BACKEND,
+        'translation_model': TRANSLATION_MODEL_NAME,
         'phase': STATUS['phase'],
         'progress': STATUS['progress'],
         'message': STATUS['message'],
@@ -295,7 +324,7 @@ def init_models():
     global LOADING_THREAD, LOADING_PARAMS
     payload = request.json or {}
     asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'reazonspeech')
-    translation_name = payload.get('translation_model') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-1.3B')
+    translation_name = payload.get('translation_model') or SERVICE_CONFIG.get('translation_model', 'SakuraLLM/Sakura-7B')
     want_gpu = payload.get('use_gpu', True)
     device = 'cuda' if want_gpu and _torch_cuda_available() else 'cpu'
     compute_type = payload.get('compute_type', 'float16' if device == 'cuda' else 'int8')
@@ -350,7 +379,7 @@ def models_load():
         return jsonify({'success': False, 'error': 'No models requested'}), 400
 
     asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'reazonspeech')
-    translation_name = payload.get('translation_model') or payload.get('translation_name') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-1.3B')
+    translation_name = payload.get('translation_model') or payload.get('translation_name') or SERVICE_CONFIG.get('translation_model', 'SakuraLLM/Sakura-7B')
     want_gpu = payload.get('use_gpu')
     if want_gpu is None:
         want_gpu = SERVICE_CONFIG.get('use_gpu', True)
@@ -393,7 +422,7 @@ def models_unload():
     payload:
       { "models": ["asr"] | ["translation"] | ["all"] }
     """
-    global ASR_MODEL, ASR_BACKEND, ASR_MODEL_NAME, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY
+    global ASR_MODEL, ASR_BACKEND, ASR_MODEL_NAME, TRANSLATION_MODEL, TOKENIZER, TRANSLATION_BACKEND, TRANSLATION_MODEL_NAME, ASR_READY, TRANSLATION_READY
     payload = request.json or {}
     models = payload.get('models') or payload.get('model') or ['all']
     if isinstance(models, str):
@@ -414,6 +443,8 @@ def models_unload():
         if unload_translation:
             TRANSLATION_MODEL = None
             TOKENIZER = None
+            TRANSLATION_BACKEND = 'nllb'
+            TRANSLATION_MODEL_NAME = None
             TRANSLATION_READY = False
 
         # Best-effort CUDA memory release
@@ -557,6 +588,109 @@ def transcribe():
         traceback.print_exc()
         return jsonify({'success': False, 'error': str(e)}), 500
 
+_NLLB_LANG_MAP = {
+    'zh': 'zho_Hans', 'en': 'eng_Latn', 'ja': 'jpn_Jpan',
+    'ko': 'kor_Hang', 'de': 'deu_Latn', 'fr': 'fra_Latn',
+    'es': 'spa_Latn', 'ru': 'rus_Cyrl', 'ar': 'arb_Arab'
+}
+_M2M100_LANG_MAP = {
+    'zh': 'zh', 'en': 'en', 'ja': 'ja', 'ko': 'ko',
+    'de': 'de', 'fr': 'fr', 'es': 'es', 'ru': 'ru', 'ar': 'ar'
+}
+_LANG_NAME_MAP = {
+    'zh': '中文', 'en': '英文', 'ja': '日文', 'ko': '韩文',
+    'de': '德文', 'fr': '法文', 'es': '西班牙文', 'ru': '俄文', 'ar': '阿拉伯文'
+}
+
+
+def _normalize_lang_code(code: str | None) -> str:
+    if not code:
+        return ''
+    code = str(code).lower()
+    if '_' in code:
+        code = code.split('_', 1)[0]
+    return code
+
+
+def _lang_display_name(code: str | None) -> str:
+    norm = _normalize_lang_code(code)
+    return _LANG_NAME_MAP.get(norm, norm or '原文')
+
+
+def _build_sakura_prompt(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
+    src_name = _lang_display_name(src_lang)
+    tgt_name = _lang_display_name(tgt_lang)
+    return (
+        f"你是专业翻译。请把下面的{src_name}翻译成{tgt_name}，不要润色、不要解释、不要添加内容，只输出译文。\n"
+        f"{text}\n"
+        "译文："
+    )
+
+
+def _translate_with_sakura(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
+    prompt = _build_sakura_prompt(text, src_lang, tgt_lang)
+    inputs = TOKENIZER(prompt, return_tensors='pt')
+    if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
+        inputs = {k: v.to('cuda') for k, v in inputs.items()}
+    input_len = inputs['input_ids'].shape[1]
+    max_new_tokens = min(512, max(64, len(text) * 2))
+    gen_tokens = TRANSLATION_MODEL.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+        eos_token_id=TOKENIZER.eos_token_id,
+        pad_token_id=TOKENIZER.pad_token_id,
+    )
+    gen = gen_tokens[0][input_len:]
+    translated = TOKENIZER.decode(gen, skip_special_tokens=True).strip()
+    for prefix in ('译文：', '译文:', 'Translation:', '翻译：'):
+        if translated.startswith(prefix):
+            translated = translated[len(prefix):].strip()
+            break
+    return translated
+
+
+def _translate_text_internal(text: str, src_lang: str | None, tgt_lang: str | None) -> str:
+    if TRANSLATION_BACKEND == 'sakura':
+        return _translate_with_sakura(text, src_lang, tgt_lang)
+
+    is_m2m100 = TRANSLATION_BACKEND == 'm2m100'
+    if is_m2m100:
+        src_code = _M2M100_LANG_MAP.get(src_lang, src_lang)
+        tgt_code = _M2M100_LANG_MAP.get(tgt_lang, tgt_lang)
+        TOKENIZER.src_lang = src_code
+        inputs = TOKENIZER(text, return_tensors='pt')
+        if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
+            inputs = {k: v.to('cuda') for k, v in inputs.items()}
+        tgt_lang_id = TOKENIZER.get_lang_id(tgt_code)
+        gen_tokens = TRANSLATION_MODEL.generate(
+            **inputs,
+            forced_bos_token_id=tgt_lang_id,
+            max_length=512,
+            num_beams=int(SERVICE_CONFIG.get('beam_size', 3) or 3),
+            early_stopping=True
+        )
+        decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
+    else:
+        src_code = _NLLB_LANG_MAP.get(src_lang, src_lang)
+        tgt_code = _NLLB_LANG_MAP.get(tgt_lang, tgt_lang)
+        TOKENIZER.src_lang = src_code
+        inputs = TOKENIZER(text, return_tensors='pt')
+        if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
+            inputs = {k: v.to('cuda') for k, v in inputs.items()}
+        gen_tokens = TRANSLATION_MODEL.generate(
+            **inputs,
+            forced_bos_token_id=TOKENIZER.convert_tokens_to_ids(tgt_code),
+            max_length=512,
+            num_beams=int(SERVICE_CONFIG.get('beam_size', 3) or 3)
+        )
+        decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
+
+    if not decoded:
+        raise ValueError('Translation produced empty result')
+    return decoded[0]
+
 @app.route('/translate', methods=['POST'])
 def translate():
     if not TRANSLATION_READY:
@@ -569,64 +703,13 @@ def translate():
         return jsonify({'success': False, 'error': 'No text'}), 400
     if not src_lang or not tgt_lang:
         return jsonify({'success': False, 'error': 'Missing languages'}), 400
-    
-    # 语言代码映射 - 支持NLLB和M2M100
-    # M2M100使用简单的ISO代码（zh, en等）
-    # NLLB使用扩展代码（zho_Hans, eng_Latn等）
-    nllb_lang_map = {
-        'zh': 'zho_Hans', 'en': 'eng_Latn', 'ja': 'jpn_Jpan', 
-        'ko': 'kor_Hang', 'de': 'deu_Latn', 'fr': 'fra_Latn',
-        'es': 'spa_Latn', 'ru': 'rus_Cyrl', 'ar': 'arb_Arab'
-    }
-    m2m100_lang_map = {
-        'zh': 'zh', 'en': 'en', 'ja': 'ja', 'ko': 'ko', 
-        'de': 'de', 'fr': 'fr', 'es': 'es', 'ru': 'ru', 'ar': 'ar'
-    }
-    
-    # 检测模型类型
-    is_m2m100 = isinstance(TOKENIZER, M2M100Tokenizer) if M2M100Tokenizer else False
-    
+
     try:
         # 使用锁防止并发访问模型（修复"Already borrowed"错误）
         with MODEL_LOCK:
             with (torch.inference_mode() if torch else _nullcontext()):
-                if is_m2m100:
-                    # M2M100翻译流程
-                    src_code = m2m100_lang_map.get(src_lang, src_lang)
-                    tgt_code = m2m100_lang_map.get(tgt_lang, tgt_lang)
-                    TOKENIZER.src_lang = src_code
-                    inputs = TOKENIZER(text, return_tensors='pt')
-                    if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
-                        inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                    # M2M100使用forced_bos_token_id指定目标语言
-                    tgt_lang_id = TOKENIZER.get_lang_id(tgt_code)
-                    gen_tokens = TRANSLATION_MODEL.generate(
-                        **inputs,
-                        forced_bos_token_id=tgt_lang_id,
-                        max_length=512,
-                        num_beams=3,
-                        early_stopping=True
-                    )
-                    decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
-                else:
-                    # NLLB翻译流程
-                    src_code = nllb_lang_map.get(src_lang, src_lang)
-                    tgt_code = nllb_lang_map.get(tgt_lang, tgt_lang)
-                    TOKENIZER.src_lang = src_code
-                    inputs = TOKENIZER(text, return_tensors='pt')
-                    if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
-                        inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                    gen_tokens = TRANSLATION_MODEL.generate(
-                        **inputs,
-                        forced_bos_token_id=TOKENIZER.convert_tokens_to_ids(tgt_code),
-                        max_length=512,
-                        num_beams=3
-                    )
-                    decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
-        
-        if not decoded:
-            return jsonify({'success': False, 'error': 'Translation produced empty result'}), 500
-        translated = decoded[0]
+                translated = _translate_text_internal(text, src_lang, tgt_lang)
+
         return jsonify({'success': True, 'translated_text': translated})
     except Exception as e:
         import traceback
@@ -663,58 +746,9 @@ def process():
             'source_language': source_lang,
             'target_language': tgt_lang
         }
-        # 调用翻译逻辑（支持M2M100和NLLB）
+        # 调用翻译逻辑（支持 Sakura LLM / M2M100 / NLLB）
         try:
-            # 语言代码映射
-            nllb_lang_map = {
-                'zh': 'zho_Hans', 'en': 'eng_Latn', 'ja': 'jpn_Jpan', 
-                'ko': 'kor_Hang', 'de': 'deu_Latn', 'fr': 'fra_Latn',
-                'es': 'spa_Latn', 'ru': 'rus_Cyrl', 'ar': 'arb_Arab'
-            }
-            m2m100_lang_map = {
-                'zh': 'zh', 'en': 'en', 'ja': 'ja', 'ko': 'ko', 
-                'de': 'de', 'fr': 'fr', 'es': 'es', 'ru': 'ru', 'ar': 'ar'
-            }
-            
-            # 检测模型类型
-            is_m2m100 = isinstance(TOKENIZER, M2M100Tokenizer) if M2M100Tokenizer else False
-            
-            if is_m2m100:
-                # M2M100翻译流程
-                src_code = m2m100_lang_map.get(source_lang, source_lang)
-                tgt_code = m2m100_lang_map.get(tgt_lang, tgt_lang)
-                TOKENIZER.src_lang = src_code
-                inputs = TOKENIZER(translate_data['text'], return_tensors='pt')
-                if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
-                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                tgt_lang_id = TOKENIZER.get_lang_id(tgt_code)
-                gen_tokens = TRANSLATION_MODEL.generate(
-                    **inputs, 
-                    forced_bos_token_id=tgt_lang_id,
-                    max_length=512, 
-                    num_beams=3,
-                    early_stopping=True
-                )
-                decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
-            else:
-                # NLLB翻译流程
-                src_code = nllb_lang_map.get(source_lang, source_lang)
-                tgt_code = nllb_lang_map.get(tgt_lang, tgt_lang)
-                TOKENIZER.src_lang = src_code
-                inputs = TOKENIZER(translate_data['text'], return_tensors='pt')
-                if torch and TRANSLATION_MODEL and torch.cuda.is_available() and next(TRANSLATION_MODEL.parameters()).is_cuda:
-                    inputs = {k: v.to('cuda') for k, v in inputs.items()}
-                gen_tokens = TRANSLATION_MODEL.generate(
-                    **inputs, 
-                    forced_bos_token_id=TOKENIZER.convert_tokens_to_ids(tgt_code), 
-                    max_length=512, 
-                    num_beams=3
-                )
-                decoded = TOKENIZER.batch_decode(gen_tokens, skip_special_tokens=True)
-            
-            if not decoded:
-                raise ValueError('Translation produced empty result')
-            translated_text = decoded[0]
+            translated_text = _translate_text_internal(translate_data['text'], source_lang, tgt_lang)
             
             return jsonify({'success': True, 'source_text': data.get('text'), 'translated_text': translated_text, 'source_language': source_lang, 'target_language': tgt_lang, 'segments': data.get('segments')})
         except Exception as e:
@@ -738,7 +772,7 @@ if __name__ == '__main__':
     default_host = getattr(app_config, 'service_host', '127.0.0.1')
     default_port = getattr(app_config, 'service_port', 50515)
     default_asr_model_size = getattr(app_config, 'asr_model_size', 'reazonspeech')
-    default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-1.3B')
+    default_translation_model = getattr(app_config, 'translation_model', 'SakuraLLM/Sakura-7B')
     default_use_gpu = getattr(app_config, 'use_gpu', True)
     default_lazy_load = getattr(app_config, 'lazy_load_models', False)
     default_asr_transformers_chunk_sec = getattr(app_config, 'asr_transformers_chunk_sec', 30)

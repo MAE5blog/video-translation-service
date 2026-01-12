@@ -79,7 +79,7 @@ unload_models_after_tasks = false
 # ASR模型大小: tiny, base, small, medium, large-v3, reazonspeech
 # reazonspeech 为日语优化模型（transformers 后端）；如需自定义，可用 reazonspeech:HF模型名
 asr_model_size = reazonspeech
-translation_model = facebook/nllb-200-1.3B
+translation_model = SakuraLLM/Sakura-7B
 use_gpu = true
 beam_size = 3
 
@@ -249,9 +249,9 @@ port = 50515
 asr_model_size = reazonspeech
 
 # 翻译模型
-# 推荐: facebook/nllb-200-distilled-1.3B（高质量）
-# 可选: facebook/nllb-200-distilled-600M（更快）
-translation_model = facebook/nllb-200-1.3B
+# 推荐: SakuraLLM/Sakura-7B（日->中更好，显存占用更高）
+# 备选: facebook/nllb-200-distilled-1.3B（高质量）
+translation_model = SakuraLLM/Sakura-7B
 
 # 使用GPU
 use_gpu = true
@@ -292,9 +292,12 @@ format = srt
 
 | 模型 | 大小 | 速度 | 质量 | 推荐 |
 |------|------|------|------|------|
+| SakuraLLM/Sakura-7B | 7B | 慢 | 高 | 日->中 |
 | nllb-200-distilled-600M | 600M | 快 | 良好 | 快速 |
-| **nllb-200-distilled-1.3B** | 1.3B | 中等 | 高 | **推荐** |
+| nllb-200-distilled-1.3B | 1.3B | 中等 | 高 | 通用 |
 | m2m100_418M | 418M | 很快 | 可用 | 极速 |
+
+注：Sakura LLM 为日->中翻译模型（CausalLM），显存占用更高；如显存不足可改用 NLLB 系列。
 
 ## 💡 DeepSeek 润色
 
@@ -413,7 +416,8 @@ video-translation-service/
 │   └── *.json                  # 进度文件
 └── models/                     # 模型目录（自动下载）
     ├── whisper/                # ASR模型
-    └── nllb/                   # 翻译模型
+    ├── nllb/                   # 翻译模型
+    └── sakura/                 # Sakura LLM 模型
 ```
 
 ## 🔧 进度管理
@@ -579,6 +583,7 @@ MIT License
 ## 🙏 致谢
 
 - [faster-whisper](https://github.com/guillaumekln/faster-whisper) - ASR引擎
+- [SakuraLLM](https://huggingface.co/SakuraLLM) - 翻译模型
 - [NLLB](https://github.com/facebookresearch/fairseq/tree/nllb) - 翻译模型
 - [DeepSeek](https://www.deepseek.com/) - AI润色服务
 

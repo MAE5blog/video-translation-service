@@ -98,7 +98,7 @@ class Config:
 
     @property
     def translation_model(self):
-        return self.get('Models', 'translation_model', 'facebook/nllb-200-1.3B')
+        return self.get('Models', 'translation_model', 'SakuraLLM/Sakura-7B')
 
     @property
     def use_gpu(self):
