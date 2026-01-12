@@ -76,7 +76,9 @@ manage_models = false
 unload_models_after_tasks = false
 
 [Models]
-asr_model_size = medium
+# ASR模型大小: tiny, base, small, medium, large-v3, reazonspeech
+# reazonspeech 为日语优化模型（transformers 后端）；如需自定义，可用 reazonspeech:HF模型名
+asr_model_size = reazonspeech
 translation_model = facebook/nllb-200-1.3B
 use_gpu = true
 beam_size = 3
@@ -237,9 +239,9 @@ port = 50515
 
 [Models]
 # ASR模型大小
-# 选项: tiny, base, small, medium, large-v3
-# 推荐: medium（速度和质量平衡）
-asr_model_size = medium
+# 选项: tiny, base, small, medium, large-v3, reazonspeech
+# 推荐: reazonspeech（日语更好）；其它语言可用 medium/large-v3
+asr_model_size = reazonspeech
 
 # 翻译模型
 # 推荐: facebook/nllb-200-distilled-1.3B（高质量）
@@ -274,8 +276,12 @@ format = srt
 | tiny | 39M | 最快 | 一般 | 测试 |
 | base | 74M | 很快 | 可用 | 快速处理 |
 | small | 244M | 快 | 良好 | 一般使用 |
-| **medium** | 769M | 中等 | 优秀 | **推荐** |
+| **medium** | 769M | 中等 | 优秀 | 其它语言推荐 |
 | large-v3 | 1.5B | 慢 | 最好 | 高质量需求 |
+| reazonspeech | - | 中等 | **日语更好** | 日语视频推荐 |
+
+注：`reazonspeech` 使用 transformers 后端（默认模型：`japanese-asr/distil-whisper-large-v3-ja-reazonspeech-large`），
+可自定义为 `reazonspeech:HF模型名`；其它语言建议用 `medium/large-v3`。
 
 #### 翻译模型
 

@@ -21,12 +21,16 @@ except ImportError:
     WhisperModel = None
 try:
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, M2M100ForConditionalGeneration, M2M100Tokenizer
+    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
     import torch
 except ImportError:
     AutoTokenizer = None
     AutoModelForSeq2SeqLM = None
     M2M100ForConditionalGeneration = None
     M2M100Tokenizer = None
+    AutoModelForSpeechSeq2Seq = None
+    AutoProcessor = None
+    pipeline = None
     torch = None
 
 app = Flask(__name__)
@@ -35,17 +39,35 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 MODEL_LOCK = threading.Lock()
 ASR_MODEL = None
+ASR_BACKEND = 'faster-whisper'
+ASR_MODEL_NAME = None
 TRANSLATION_MODEL = None
 TOKENIZER = None
 
 # Defaults are populated in __main__ (and used by /models/load when payload omits fields)
 SERVICE_CONFIG = {
-    'asr_model_size': 'medium',
+    'asr_model_size': 'reazonspeech',
     'translation_model': 'facebook/nllb-200-1.3B',
     'use_gpu': True,
     'device': 'cuda' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu',
     'compute_type': 'float16' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'int8',
 }
+
+DEFAULT_REAZON_ASR_MODEL = 'japanese-asr/distil-whisper-large-v3-ja-reazonspeech-large'
+
+
+def _resolve_asr_backend(asr_size: str) -> tuple[str, str]:
+    """返回 (backend, model_id_or_size)；reazonspeech 走 transformers，其它走 faster-whisper。"""
+    raw = (asr_size or '').strip()
+    if not raw:
+        return 'transformers', DEFAULT_REAZON_ASR_MODEL
+    low = raw.lower()
+    if low.startswith('reazonspeech:'):
+        model_id = raw.split(':', 1)[1].strip() or DEFAULT_REAZON_ASR_MODEL
+        return 'transformers', model_id
+    if low in ('reazonspeech', 'reazon', 'rs'):
+        return 'transformers', DEFAULT_REAZON_ASR_MODEL
+    return 'faster-whisper', raw
 
 
 def _want_traceback() -> bool:
@@ -114,19 +136,46 @@ def _set_error(err_msg: str):
 def _load_models_async(asr_size: str, translation_name: str, device: str, compute_type: str,
                        load_asr: bool = True, load_translation: bool = True):
     """Background thread target to load models with phase updates."""
-    global ASR_MODEL, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY, LOADING_THREAD
+    global ASR_MODEL, ASR_BACKEND, ASR_MODEL_NAME, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY, LOADING_THREAD
     try:
         if STATUS['started_at'] is None:
             STATUS['started_at'] = time.time()
         # ASR model
-        if load_asr and WhisperModel and not ASR_READY:
-            _set_status('asr_downloading', 0.02, f'Downloading/Preparing ASR model {asr_size} ...')
+        if load_asr and not ASR_READY:
+            asr_backend, asr_id = _resolve_asr_backend(asr_size)
+            ASR_BACKEND = asr_backend
+            ASR_MODEL_NAME = asr_id
+            _set_status('asr_downloading', 0.02, f'Downloading/Preparing ASR model {asr_id} ...')
             try:
-                # faster-whisper downloads inside constructor
-                _set_status('asr_loading', 0.08, f'Loading ASR model {asr_size} ...')
-                ASR_MODEL = WhisperModel(asr_size, device=device, compute_type=compute_type, download_root='./models/whisper')
+                if asr_backend == 'transformers':
+                    if not (AutoModelForSpeechSeq2Seq and AutoProcessor and pipeline and torch):
+                        raise ImportError('Transformers ASR not available')
+                    _set_status('asr_loading', 0.08, f'Loading ASR model {asr_id} (transformers) ...')
+                    dtype = torch.float16 if device == 'cuda' else torch.float32
+                    model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                        asr_id,
+                        torch_dtype=dtype,
+                        low_cpu_mem_usage=True,
+                        cache_dir='./models/reazonspeech'
+                    )
+                    if device == 'cuda':
+                        model = model.to(device)
+                    processor = AutoProcessor.from_pretrained(asr_id, cache_dir='./models/reazonspeech')
+                    ASR_MODEL = pipeline(
+                        'automatic-speech-recognition',
+                        model=model,
+                        tokenizer=processor.tokenizer,
+                        feature_extractor=processor.feature_extractor,
+                        device=0 if device == 'cuda' else -1
+                    )
+                else:
+                    if not WhisperModel:
+                        raise ImportError('faster-whisper not available')
+                    # faster-whisper downloads inside constructor
+                    _set_status('asr_loading', 0.08, f'Loading ASR model {asr_id} (faster-whisper) ...')
+                    ASR_MODEL = WhisperModel(asr_id, device=device, compute_type=compute_type, download_root='./models/whisper')
                 ASR_READY = True
-                _set_status('asr_ready', 0.35, f'ASR model ready ({asr_size}).')
+                _set_status('asr_ready', 0.35, f'ASR model ready ({asr_id}).')
             except Exception as e:
                 _set_error(f'ASR load failed: {e}')
                 return
@@ -178,6 +227,8 @@ def health():
         'status': 'ok',
         'asr_ready': ASR_READY,
         'translation_ready': TRANSLATION_READY,
+        'asr_backend': ASR_BACKEND,
+        'asr_model': ASR_MODEL_NAME,
         'phase': STATUS['phase'],
         'progress': STATUS['progress'],
         'message': STATUS['message'],
@@ -222,8 +273,8 @@ def gpu_clear():
 def init_models():
     global LOADING_THREAD, LOADING_PARAMS
     payload = request.json or {}
-    asr_size = payload.get('asr_model_size', 'medium')
-    translation_name = payload.get('translation_model', 'facebook/nllb-200-1.3B')
+    asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'reazonspeech')
+    translation_name = payload.get('translation_model') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-1.3B')
     want_gpu = payload.get('use_gpu', True)
     device = 'cuda' if want_gpu and _torch_cuda_available() else 'cpu'
     compute_type = payload.get('compute_type', 'float16' if device == 'cuda' else 'int8')
@@ -277,7 +328,7 @@ def models_load():
     if not want_asr and not want_translation:
         return jsonify({'success': False, 'error': 'No models requested'}), 400
 
-    asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'medium')
+    asr_size = payload.get('asr_model_size') or SERVICE_CONFIG.get('asr_model_size', 'reazonspeech')
     translation_name = payload.get('translation_model') or payload.get('translation_name') or SERVICE_CONFIG.get('translation_model', 'facebook/nllb-200-1.3B')
     want_gpu = payload.get('use_gpu')
     if want_gpu is None:
@@ -321,7 +372,7 @@ def models_unload():
     payload:
       { "models": ["asr"] | ["translation"] | ["all"] }
     """
-    global ASR_MODEL, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY
+    global ASR_MODEL, ASR_BACKEND, ASR_MODEL_NAME, TRANSLATION_MODEL, TOKENIZER, ASR_READY, TRANSLATION_READY
     payload = request.json or {}
     models = payload.get('models') or payload.get('model') or ['all']
     if isinstance(models, str):
@@ -336,6 +387,8 @@ def models_unload():
     with MODEL_LOCK:
         if unload_asr:
             ASR_MODEL = None
+            ASR_BACKEND = 'faster-whisper'
+            ASR_MODEL_NAME = None
             ASR_READY = False
         if unload_translation:
             TRANSLATION_MODEL = None
@@ -421,24 +474,55 @@ def transcribe():
             os.remove(path)
             path = wav_path
         
-        # ✅ 启用VAD，在语音边界截断，避免在单词中间切断
-        # 使用锁防止与 /models/unload 并发导致崩溃
+        # ✅ 使用锁防止与 /models/unload 并发导致崩溃
         with MODEL_LOCK:
-            segments, info = ASR_MODEL.transcribe(
-                path,
-                language=language,
-                vad_filter=True,  # 使用VAD检测静音点，在语音边界截断
-                beam_size=5,
-                best_of=5
-            )
-        
-        text = ''
-        seg_list = []
-        for s in segments:
-            text += s.text
-            seg_list.append({'start': s.start, 'end': s.end, 'text': s.text})
+            if ASR_BACKEND == 'transformers':
+                gen_kwargs = {'task': 'transcribe'}
+                if language and language != 'auto':
+                    gen_kwargs['language'] = language
+                result = ASR_MODEL(
+                    path,
+                    return_timestamps=True,
+                    generate_kwargs=gen_kwargs
+                )
+                text = (result.get('text') or '').strip()
+                chunks = result.get('chunks') or result.get('segments') or []
+                seg_list = []
+                for ch in chunks:
+                    ts = ch.get('timestamp') or ch.get('timestamps')
+                    if isinstance(ts, (list, tuple)) and len(ts) >= 2:
+                        start, end = ts[0], ts[1]
+                    else:
+                        start = ch.get('start')
+                        end = ch.get('end')
+                    if start is None:
+                        start = 0.0
+                    if end is None:
+                        end = start
+                    seg_list.append({
+                        'start': float(start),
+                        'end': float(end),
+                        'text': (ch.get('text') or '').strip()
+                    })
+                info_language = language or 'unknown'
+                info_prob = None
+            else:
+                segments, info = ASR_MODEL.transcribe(
+                    path,
+                    language=language,
+                    vad_filter=True,  # 使用VAD检测静音点，在语音边界截断
+                    beam_size=5,
+                    best_of=5
+                )
+                text = ''
+                seg_list = []
+                for s in segments:
+                    text += s.text
+                    seg_list.append({'start': s.start, 'end': s.end, 'text': s.text})
+                info_language = info.language
+                info_prob = info.language_probability
         os.remove(path)
-        return jsonify({'success': True, 'text': text.strip(), 'language': info.language, 'language_probability': info.language_probability, 'segments': seg_list, 'processing_time_ms': int((time.time()-started)*1000)})
+        return jsonify({'success': True, 'text': text.strip(), 'language': info_language, 'language_probability': info_prob, 'segments': seg_list, 'processing_time_ms': int((time.time()-started)*1000)})
     except Exception as e:
         if os.path.exists(path):
             os.remove(path)
@@ -625,7 +709,7 @@ if __name__ == '__main__':
 
     default_host = getattr(app_config, 'service_host', '127.0.0.1')
     default_port = getattr(app_config, 'service_port', 50515)
-    default_asr_model_size = getattr(app_config, 'asr_model_size', 'medium')
+    default_asr_model_size = getattr(app_config, 'asr_model_size', 'reazonspeech')
     default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-1.3B')
     default_use_gpu = getattr(app_config, 'use_gpu', True)
     default_lazy_load = getattr(app_config, 'lazy_load_models', False)

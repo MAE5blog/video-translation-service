@@ -94,7 +94,7 @@ class Config:
     # 模型配置
     @property
     def asr_model_size(self):
-        return self.get('Models', 'asr_model_size', 'medium')
+        return self.get('Models', 'asr_model_size', 'reazonspeech')
 
     @property
     def translation_model(self):

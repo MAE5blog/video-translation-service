@@ -123,7 +123,11 @@ def main() -> int:
         action="store_true",
         help="Only write translated lines (default: bilingual)",
     )
-    parser.add_argument("--asr-model-size", default="medium", help="ASR model size for /init")
+    parser.add_argument(
+        "--asr-model-size",
+        default="reazonspeech",
+        help="ASR model size for /init (reazonspeech / tiny / base / small / medium / large-v3)",
+    )
     parser.add_argument(
         "--translation-model",
         default="facebook/nllb-200-distilled-1.3B",
@@ -166,4 +170,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
