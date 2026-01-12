@@ -621,7 +621,7 @@ def _build_sakura_prompt(text: str, src_lang: str | None, tgt_lang: str | None) 
     src_name = _lang_display_name(src_lang)
     tgt_name = _lang_display_name(tgt_lang)
     return (
-        f"你是专业翻译。请把下面的{src_name}翻译成{tgt_name}，不要润色、不要解释、不要添加内容，只输出译文。\n"
+        f"你是专业翻译。请把下面的{src_name}翻译成{tgt_name}，只输出译文。\n"
         f"{text}\n"
         "译文："
     )
