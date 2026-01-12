@@ -79,7 +79,7 @@ unload_models_after_tasks = false
 # ASR模型大小: tiny, base, small, medium, large-v3, reazonspeech
 # reazonspeech 为日语优化模型（transformers 后端）；如需自定义，可用 reazonspeech:HF模型名
 asr_model_size = reazonspeech
-translation_model = SakuraLLM/Sakura-7B
+translation_model = SakuraLLM/Sakura-4B-Qwen3-Base-v2
 use_gpu = true
 beam_size = 3
 
@@ -249,9 +249,9 @@ port = 50515
 asr_model_size = reazonspeech
 
 # 翻译模型
-# 推荐: SakuraLLM/Sakura-7B（日->中更好，显存占用更高）
+# 推荐: SakuraLLM/Sakura-4B-Qwen3-Base-v2（日->中更好，显存占用较低）
 # 备选: facebook/nllb-200-distilled-1.3B（高质量）
-translation_model = SakuraLLM/Sakura-7B
+translation_model = SakuraLLM/Sakura-4B-Qwen3-Base-v2
 
 # 使用GPU
 use_gpu = true
@@ -292,7 +292,7 @@ format = srt
 
 | 模型 | 大小 | 速度 | 质量 | 推荐 |
 |------|------|------|------|------|
-| SakuraLLM/Sakura-7B | 7B | 慢 | 高 | 日->中 |
+| SakuraLLM/Sakura-4B-Qwen3-Base-v2 | 4B | 中等 | 高 | 日->中 |
 | nllb-200-distilled-600M | 600M | 快 | 良好 | 快速 |
 | nllb-200-distilled-1.3B | 1.3B | 中等 | 高 | 通用 |
 | m2m100_418M | 418M | 很快 | 可用 | 极速 |
