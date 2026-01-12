@@ -51,6 +51,8 @@ SERVICE_CONFIG = {
     'use_gpu': True,
     'device': 'cuda' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'cpu',
     'compute_type': 'float16' if (torch and hasattr(torch, 'cuda') and torch.cuda.is_available()) else 'int8',
+    'asr_transformers_chunk_sec': 30,
+    'asr_transformers_stride_sec': 5.0,
 }
 
 DEFAULT_REAZON_ASR_MODEL = 'japanese-asr/distil-whisper-large-v3-ja-reazonspeech-large'
@@ -68,6 +70,25 @@ def _resolve_asr_backend(asr_size: str) -> tuple[str, str]:
     if low in ('reazonspeech', 'reazon', 'rs'):
         return 'transformers', DEFAULT_REAZON_ASR_MODEL
     return 'faster-whisper', raw
+
+
+def _get_transformers_chunk_settings() -> tuple[float, float] | None:
+    """获取 transformers ASR 内部分块配置（<=0 表示禁用）。"""
+    try:
+        chunk_sec = float(SERVICE_CONFIG.get('asr_transformers_chunk_sec', 30) or 0)
+    except Exception:
+        chunk_sec = 30.0
+    try:
+        stride_sec = float(SERVICE_CONFIG.get('asr_transformers_stride_sec', 5.0) or 0.0)
+    except Exception:
+        stride_sec = 5.0
+    if chunk_sec <= 0:
+        return None
+    if stride_sec < 0:
+        stride_sec = 0.0
+    if stride_sec >= chunk_sec:
+        stride_sec = max(0.0, chunk_sec - 0.1)
+    return chunk_sec, stride_sec
 
 
 def _want_traceback() -> bool:
@@ -480,11 +501,18 @@ def transcribe():
                 gen_kwargs = {'task': 'transcribe'}
                 if language and language != 'auto':
                     gen_kwargs['language'] = language
-                result = ASR_MODEL(
-                    path,
-                    return_timestamps=True,
-                    generate_kwargs=gen_kwargs
-                )
+                pipe_kwargs = {
+                    'return_timestamps': True,
+                    'generate_kwargs': gen_kwargs,
+                }
+                chunk_settings = _get_transformers_chunk_settings()
+                if chunk_settings:
+                    chunk_sec, stride_sec = chunk_settings
+                    pipe_kwargs['chunk_length_s'] = chunk_sec
+                    if stride_sec:
+                        pipe_kwargs['stride_length_s'] = stride_sec
+                    pipe_kwargs['batch_size'] = 1
+                result = ASR_MODEL(path, **pipe_kwargs)
                 text = (result.get('text') or '').strip()
                 chunks = result.get('chunks') or result.get('segments') or []
                 seg_list = []
@@ -713,6 +741,8 @@ if __name__ == '__main__':
     default_translation_model = getattr(app_config, 'translation_model', 'facebook/nllb-200-1.3B')
     default_use_gpu = getattr(app_config, 'use_gpu', True)
     default_lazy_load = getattr(app_config, 'lazy_load_models', False)
+    default_asr_transformers_chunk_sec = getattr(app_config, 'asr_transformers_chunk_sec', 30)
+    default_asr_transformers_stride_sec = getattr(app_config, 'asr_transformers_stride_sec', 5.0)
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--host', default=default_host)
@@ -759,6 +789,8 @@ if __name__ == '__main__':
             'use_gpu': bool(device == 'cuda'),
             'device': device,
             'compute_type': compute_type,
+            'asr_transformers_chunk_sec': default_asr_transformers_chunk_sec,
+            'asr_transformers_stride_sec': default_asr_transformers_stride_sec,
         })
     except Exception:
         pass

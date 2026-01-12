@@ -53,6 +53,14 @@ class Config:
         except ValueError:
             return default
 
+    def get_float(self, section, key, default=0.0):
+        """获取浮点数配置"""
+        value = self.get(section, key, str(default))
+        try:
+            return float(value)
+        except ValueError:
+            return default
+
     # API配置
     @property
     def deepseek_api_key(self):
@@ -90,6 +98,17 @@ class Config:
     def clear_cuda_cache_before_tasks(self):
         """是否在 GPU 重任务前清理 CUDA 显存缓存（torch.cuda.empty_cache）"""
         return self.get_bool('GPU', 'clear_cuda_cache_before_tasks', False)
+
+    # ASR 运行配置
+    @property
+    def asr_transformers_chunk_sec(self):
+        """Transformers ASR 内部分块秒数（仅对 transformers 后端生效；0=禁用）"""
+        return self.get_int('ASR', 'transformers_chunk_sec', 30)
+
+    @property
+    def asr_transformers_stride_sec(self):
+        """Transformers ASR 分块重叠秒数（仅对 transformers 后端生效）"""
+        return self.get_float('ASR', 'transformers_stride_sec', 5.0)
 
     # 翻译配置
     @property
@@ -130,6 +149,8 @@ if __name__ == '__main__':
     print(f"使用GPU: {config.use_gpu}")
     print(f"beam_size: {config.beam_size}")
     print(f"GPU任务前清理显存缓存: {config.clear_cuda_cache_before_tasks}")
+    print(f"ASR transformers 分块秒数: {config.asr_transformers_chunk_sec}")
+    print(f"ASR transformers 分块重叠秒数: {config.asr_transformers_stride_sec}")
     print(f"默认目标语言: {config.default_target_language}")
     print(f"使用DeepSeek润色: {config.use_deepseek_polish}")
     print(f"启用人声分离: {config.enable_vocal_separation}")

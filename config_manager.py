@@ -130,6 +130,16 @@ class Config:
         """ASR 分块重叠秒数（避免切在单词中间）"""
         return self.get_float('ASR', 'chunk_overlap_sec', 0.0)
 
+    @property
+    def asr_transformers_chunk_sec(self):
+        """Transformers ASR 内部分块秒数（仅对 transformers 后端生效；0=禁用）"""
+        return self.get_int('ASR', 'transformers_chunk_sec', 30)
+
+    @property
+    def asr_transformers_stride_sec(self):
+        """Transformers ASR 分块重叠秒数（仅对 transformers 后端生效）"""
+        return self.get_float('ASR', 'transformers_stride_sec', 5.0)
+
     # 翻译配置
     @property
     def default_target_language(self):

@@ -97,6 +97,11 @@ language = auto
 chunk_sec = 900
 chunk_overlap_sec = 1.0
 
+# 可选：transformers ASR 内部分块（仅对 reazonspeech/transformers 后端生效）
+# 默认 30s/5s 可显著降低长音频 OOM/掉线风险；如稳定可调大或设 0 禁用
+transformers_chunk_sec = 30
+transformers_stride_sec = 5.0
+
 [Translation]
 default_target_language = zh
 use_deepseek_polish = true  # 启用DeepSeek润色
