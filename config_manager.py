@@ -140,6 +140,21 @@ class Config:
         """Transformers ASR 分块重叠秒数（仅对 transformers 后端生效）"""
         return self.get_float('ASR', 'transformers_stride_sec', 5.0)
 
+    @property
+    def asr_fallback_to_mix(self):
+        """Demucs 人声分离结果异常时，是否回退到原始混音"""
+        return self.get_bool('ASR', 'fallback_to_mix', True)
+
+    @property
+    def asr_fallback_max_gap_sec(self):
+        """触发回退的最大空洞阈值（秒）"""
+        return self.get_float('ASR', 'fallback_max_gap_sec', 45.0)
+
+    @property
+    def asr_fallback_end_diff_sec(self):
+        """触发回退的末尾缺失阈值（秒）"""
+        return self.get_float('ASR', 'fallback_end_diff_sec', 60.0)
+
     # GGUF/llama.cpp 配置
     @property
     def gguf_n_ctx(self):
@@ -253,6 +268,11 @@ class Config:
         """Demucs 分段秒数（用于超长音频避免 OOM；默认 1800=30分钟）"""
         return self.get_int('Audio', 'vocal_separation_chunk_sec', 1800)
 
+    @property
+    def vocal_mix_ratio(self):
+        """人声与原始混音的融合比例（0=仅人声；0.2=加入20%原始混音）"""
+        return self.get_float('Audio', 'vocal_mix_ratio', 0.0)
+
 
 # 全局配置实例
 config = Config()
@@ -273,8 +293,12 @@ if __name__ == '__main__':
     print(f"ASR语言: {config.asr_language}")
     print(f"ASR分块秒数: {config.asr_chunk_sec}")
     print(f"ASR分块重叠秒数: {config.asr_chunk_overlap_sec}")
+    print(f"ASR回退原始混音: {config.asr_fallback_to_mix}")
+    print(f"ASR回退最大空洞阈值: {config.asr_fallback_max_gap_sec}")
+    print(f"ASR回退末尾缺失阈值: {config.asr_fallback_end_diff_sec}")
     print(f"默认目标语言: {config.default_target_language}")
     print(f"使用DeepSeek润色: {config.use_deepseek_polish}")
     print(f"启用人声分离: {config.enable_vocal_separation}")
     print(f"人声分离模型: {config.vocal_separation_model}")
     print(f"人声分离设备: {config.vocal_separation_device}")
+    print(f"人声+混音融合比例: {config.vocal_mix_ratio}")

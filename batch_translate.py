@@ -10,6 +10,7 @@ import sys
 import time
 import json
 import argparse
+import math
 import logging
 import threading
 import tempfile
@@ -149,6 +150,14 @@ class VideoTranslator:
             self.vocal_separation_chunk_sec = 1800
         if self.vocal_separation_chunk_sec <= 0:
             self.vocal_separation_chunk_sec = 1800
+        if CONFIG_AVAILABLE:
+            self.vocal_mix_ratio = float(getattr(config, 'vocal_mix_ratio', 0.0) or 0.0)
+        else:
+            self.vocal_mix_ratio = 0.0
+        if self.vocal_mix_ratio < 0:
+            self.vocal_mix_ratio = 0.0
+        if self.vocal_mix_ratio > 1:
+            self.vocal_mix_ratio = 1.0
         self.clear_cuda_cache_before_tasks = bool(clear_cuda_cache_before_tasks)
         self.asr_chunk_sec = int(asr_chunk_sec or 0)
         self.asr_chunk_overlap_sec = float(asr_chunk_overlap_sec or 0.0)
@@ -179,6 +188,16 @@ class VideoTranslator:
             self.subtitle_linger_trigger_ratio = 6.0
             self.subtitle_linger_keep_ratio = 4.0
 
+        # ASR 回退：当 Demucs 人声分离导致识别出现“长空洞/末尾缺失”，自动回退到原始混音
+        if CONFIG_AVAILABLE:
+            self.asr_fallback_to_mix = bool(getattr(config, 'asr_fallback_to_mix', True))
+            self.asr_fallback_max_gap_sec = float(getattr(config, 'asr_fallback_max_gap_sec', 45.0) or 45.0)
+            self.asr_fallback_end_diff_sec = float(getattr(config, 'asr_fallback_end_diff_sec', 60.0) or 60.0)
+        else:
+            self.asr_fallback_to_mix = True
+            self.asr_fallback_max_gap_sec = 45.0
+            self.asr_fallback_end_diff_sec = 60.0
+
         # 参数兜底/保护
         if not (self.subtitle_min_duration_sec > 0):
             self.subtitle_min_duration_sec = 1.2
@@ -196,6 +215,10 @@ class VideoTranslator:
             self.subtitle_linger_trigger_ratio = 6.0
         if not (self.subtitle_linger_keep_ratio > 0):
             self.subtitle_linger_keep_ratio = 4.0
+        if self.asr_fallback_max_gap_sec < 0:
+            self.asr_fallback_max_gap_sec = 0.0
+        if self.asr_fallback_end_diff_sec < 0:
+            self.asr_fallback_end_diff_sec = 0.0
 
         # 线程池用于并发润色
         if self.use_polish:
@@ -801,6 +824,100 @@ class VideoTranslator:
             else:
                 logging.error(f"  ! Demucs 分段临时目录已保留用于排查: {work_dir}")
 
+    def _mix_vocals_with_original(self, vocals_path: Path, mix_path: Path,
+                                  output_path: Path, mix_ratio: float) -> bool:
+        """将人声与原始混音按比例融合，减少漏词空洞。"""
+        try:
+            ratio = float(mix_ratio or 0.0)
+        except Exception:
+            ratio = 0.0
+        if ratio <= 0:
+            try:
+                shutil.copyfile(vocals_path, output_path)
+                return True
+            except Exception:
+                return False
+        if ratio > 1:
+            ratio = 1.0
+        try:
+            cmd = [
+                'ffmpeg',
+                '-i', str(vocals_path),
+                '-i', str(mix_path),
+                '-filter_complex',
+                f"[0:a]volume=1.0[a0];[1:a]volume={ratio}[a1];[a0][a1]amix=inputs=2:normalize=0",
+                '-ar', '16000', '-ac', '1',
+                '-y', str(output_path),
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return output_path.exists()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ffprobe_duration_sec(path: Path) -> float | None:
+        """获取媒体时长（秒）。失败返回 None。"""
+        try:
+            p = subprocess.run(
+                [
+                    'ffprobe',
+                    '-v', 'error',
+                    '-show_entries', 'format=duration',
+                    '-of', 'default=noprint_wrappers=1:nokey=1',
+                    str(path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if p.returncode != 0:
+                return None
+            s = (p.stdout or '').strip()
+            return float(s) if s else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _calc_asr_stats(segments: list[dict], duration_sec: float | None) -> dict:
+        """统计 ASR 段落质量：最大空洞、末尾缺失等。"""
+        segs = []
+        for seg in segments or []:
+            try:
+                start = float(seg.get('start', 0.0) or 0.0)
+                end = float(seg.get('end', 0.0) or 0.0)
+            except Exception:
+                continue
+            if end < start:
+                end = start
+            segs.append((start, end))
+        segs.sort(key=lambda x: x[0])
+
+        max_gap = 0.0
+        last_end = 0.0
+        if segs:
+            last_end = segs[-1][1]
+            for a, b in zip(segs, segs[1:]):
+                gap = b[0] - a[1]
+                if gap > max_gap:
+                    max_gap = gap
+        end_diff = None
+        if duration_sec is not None:
+            end_diff = max(0.0, duration_sec - last_end)
+
+        return {
+            'count': len(segs),
+            'max_gap': float(max_gap),
+            'last_end': float(last_end),
+            'end_diff': float(end_diff) if end_diff is not None else None,
+        }
+
+    @staticmethod
+    def _asr_quality_score(stats: dict) -> float:
+        """质量评分：越小越好（更连续、更贴近视频末尾）。"""
+        max_gap = float(stats.get('max_gap') or 0.0)
+        end_diff = float(stats.get('end_diff') or 0.0)
+        return max_gap * 2.0 + end_diff
+
     @staticmethod
     def _trim_text_overlap(prev_text: str, text: str, max_words: int = 12) -> str:
         """
@@ -1302,6 +1419,84 @@ class VideoTranslator:
         text = re.sub(r'\s+', '', text)
         return len(text)
 
+    @staticmethod
+    def _split_text_by_chars(text: str, max_chars: int) -> list[str]:
+        if max_chars <= 0:
+            return [text]
+        if len(text) <= max_chars:
+            return [text]
+        if ' ' in text:
+            import textwrap
+            return textwrap.wrap(text, max_chars, break_long_words=False, break_on_hyphens=False)
+        return [text[i:i + max_chars] for i in range(0, len(text), max_chars)]
+
+    def _split_subtitle_text(self, text: str, max_chars: int, min_parts: int) -> list[str]:
+        """按标点/换行拆分字幕文本，必要时再按长度切分。"""
+        text = '' if text is None else str(text)
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        text = text.replace(r'\N', '\n')
+        sentences = []
+        sentence_punct = set('。！？?!；;')
+
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            buf = ''
+            for ch in line:
+                buf += ch
+                if ch in sentence_punct:
+                    sentences.append(buf.strip())
+                    buf = ''
+            if buf.strip():
+                sentences.append(buf.strip())
+
+        if not sentences:
+            return []
+
+        expanded = []
+        for part in sentences:
+            if max_chars > 0 and self._subtitle_char_count(part) > max_chars:
+                expanded.extend(self._split_text_by_chars(part, max_chars))
+            else:
+                expanded.append(part)
+        sentences = [p.strip() for p in expanded if p.strip()]
+
+        while min_parts and len(sentences) < min_parts:
+            idx = max(range(len(sentences)), key=lambda i: self._subtitle_char_count(sentences[i]))
+            long_part = sentences.pop(idx)
+            if len(long_part) <= 1:
+                sentences.insert(idx, long_part)
+                break
+            mid = max(1, len(long_part) // 2)
+            sub = [long_part[:mid].strip(), long_part[mid:].strip()]
+            sub = [p for p in sub if p]
+            if len(sub) < 2:
+                sentences.insert(idx, long_part)
+                break
+            for offset, piece in enumerate(sub):
+                sentences.insert(idx + offset, piece)
+
+        return sentences
+
+    @staticmethod
+    def _normalize_subtitle_text(text: str) -> str:
+        """清理重复行/前缀，降低 LLM 输出的重复对可读性的影响。"""
+        text = '' if text is None else str(text)
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        text = text.replace(r'\N', '\n')
+        lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+        cleaned = []
+        prefixes = ('译文：', '译文:', 'Translation:', '翻译：')
+        for ln in lines:
+            for p in prefixes:
+                if ln.startswith(p):
+                    ln = ln[len(p):].strip()
+                    break
+            if not cleaned or cleaned[-1] != ln:
+                cleaned.append(ln)
+        return '\n'.join(cleaned).strip()
+
     def _prepare_subtitle_segments(self, segments, translation_only: bool):
         """
         为字幕输出准备 segments：
@@ -1354,13 +1549,22 @@ class VideoTranslator:
         out = []
         total = len(items)
         for idx, (start, end, seg) in enumerate(items):
+            next_start = float(items[idx + 1][0]) if idx + 1 < total else None
             # 保障最小时长，避免 0 长度导致播放器行为异常
             if end <= start + 0.02:
                 end = start + 0.02
 
+            show_text = ''
+            if translation_only:
+                show_text = self._normalize_subtitle_text(seg.get('translated', seg.get('text', '')) or '')
+                if not show_text:
+                    continue
+                seg = dict(seg)
+                seg['translated'] = show_text
+
+            char_count = 0
             if self.subtitle_fix_linger:
                 if translation_only:
-                    show_text = seg.get('translated', seg.get('text', '')) or ''
                     char_count = self._subtitle_char_count(show_text)
                 else:
                     a = seg.get('text', '') or ''
@@ -1370,16 +1574,65 @@ class VideoTranslator:
                 ideal = (char_count / cps) if char_count > 0 else min_dur
                 if ideal < min_dur:
                     ideal = min_dur
+                if max_dur > 0 and ideal > max_dur:
+                    ideal = max_dur
 
-                dur = end - start
-                # 仅在“明显异常过长”时才收缩：避免正常语速/长句被提前截断
+            dur = end - start
+            target_total = dur
+            if self.subtitle_fix_linger:
                 if dur >= trigger_sec and dur > (ideal * trigger_ratio + slack):
-                    new_dur = ideal * keep_ratio
-                    if new_dur < min_dur:
-                        new_dur = min_dur
-                    if new_dur > max_dur:
-                        new_dur = max_dur
-                    end = start + new_dur
+                    target_total = min(dur, max(min_dur, ideal * keep_ratio))
+                if max_dur > 0 and dur > max_dur and ideal <= max_dur:
+                    target_total = min(target_total, max_dur)
+
+            if max_dur > 0 and translation_only:
+                target_parts = max(1, int(math.ceil(target_total / max_dur))) if target_total > max_dur else 1
+                max_chars = max(1, int(cps * max_dur))
+                parts = self._split_subtitle_text(show_text, max_chars, target_parts)
+                if len(parts) <= 1 and self.subtitle_fix_linger and target_total > max_dur:
+                    target_total = max_dur
+                elif len(parts) > 1:
+                    if target_total > dur:
+                        target_total = dur
+                    min_total = min_dur * len(parts)
+                    if target_total < min_total:
+                        target_total = min_total
+                    if self.subtitle_fix_linger and target_total > max_dur * len(parts):
+                        target_total = max_dur * len(parts)
+
+                    total_chars = sum(self._subtitle_char_count(p) or 1 for p in parts)
+                    remaining_total = target_total
+                    remaining_chars = total_chars
+                    cur = start
+                    for i, part in enumerate(parts):
+                        part_chars = self._subtitle_char_count(part) or 1
+                        if i == len(parts) - 1:
+                            part_dur = max(min_dur, remaining_total)
+                        else:
+                            share = remaining_total * (part_chars / max(1, remaining_chars))
+                            part_dur = max(min_dur, share)
+                            if max_dur > 0:
+                                part_dur = min(part_dur, max_dur)
+                            min_left = min_dur * (len(parts) - i - 1)
+                            if part_dur > remaining_total - min_left:
+                                part_dur = max(min_dur, remaining_total - min_left)
+                        part_end = cur + part_dur
+                        remaining_total = max(0.0, remaining_total - part_dur)
+                        remaining_chars = max(0, remaining_chars - part_chars)
+
+                        if next_start is not None and i == len(parts) - 1 and part_end > next_start - 0.01:
+                            part_end = max(cur + 0.02, next_start - 0.01)
+
+                        seg2 = dict(seg)
+                        seg2['start'] = cur
+                        seg2['end'] = part_end
+                        seg2['translated'] = part
+                        out.append(seg2)
+                        cur = part_end
+                    continue
+
+            if target_total < dur:
+                end = start + target_total
 
             # 不与下一条重叠（留一点点间隙）
             if idx + 1 < total:
@@ -1569,12 +1822,17 @@ class VideoTranslator:
             audio_path = output_dir / f"{video_path.stem}_temp.wav"
             audio_sep_path = output_dir / f"{video_path.stem}_temp_sep.wav"
             vocals_path = output_dir / f"{video_path.stem}_temp_vocals.wav"
+            vocals_mix_path = output_dir / f"{video_path.stem}_temp_vocals_mix.wav"
 
             if self.enable_vocal_separation:
                 # Demucs 建议使用较高采样率/双声道输入
                 temp_files.append(audio_sep_path)
                 if not self.extract_audio(str(video_path), str(audio_sep_path), sample_rate=44100, channels=2):
                     raise Exception("音频提取失败")
+                if self.vocal_mix_ratio > 0:
+                    temp_files.append(audio_path)
+                    if not self.extract_audio(str(video_path), str(audio_path)):
+                        raise Exception("音频提取失败")
             else:
                 temp_files.append(audio_path)
                 if not self.extract_audio(str(video_path), str(audio_path)):
@@ -1589,6 +1847,13 @@ class VideoTranslator:
                 temp_files.append(vocals_path)
                 self.separate_vocals(audio_sep_path, vocals_path)
                 asr_audio_path = vocals_path
+                if self.vocal_mix_ratio > 0:
+                    temp_files.append(vocals_mix_path)
+                    if self._mix_vocals_with_original(vocals_path, audio_path, vocals_mix_path, self.vocal_mix_ratio):
+                        asr_audio_path = vocals_mix_path
+                        logging.info(f"    [ASR] 使用人声+混音融合（mix_ratio={self.vocal_mix_ratio:.2f}）")
+                    else:
+                        logging.info("    [ASR] 融合失败，使用纯人声")
                 logging.info(f"  [{step}/{total_steps}] 人声分离完成 ✓")
             else:
                 asr_audio_path = audio_path
@@ -1606,6 +1871,49 @@ class VideoTranslator:
                 if not self.ensure_models(want_asr=True):
                     raise Exception("ASR模型加载失败")
             result = self.transcribe(str(asr_audio_path), language=asr_language)
+
+            # Demucs 人声分离可能导致“长空洞/末尾缺失”，必要时回退到原始混音
+            if self.enable_vocal_separation and self.asr_fallback_to_mix:
+                duration_sec = self._ffprobe_duration_sec(video_path)
+                base_segments = (result or {}).get('segments', []) if isinstance(result, dict) else []
+                base_stats = self._calc_asr_stats(base_segments, duration_sec)
+                need_fallback = False
+
+                if not result or not result.get('success'):
+                    need_fallback = True
+                    logging.info("    [ASR] 人声分离识别失败，尝试回退到原始混音...")
+                else:
+                    max_gap = base_stats.get('max_gap') or 0.0
+                    end_diff = base_stats.get('end_diff')
+                    if max_gap >= self.asr_fallback_max_gap_sec:
+                        need_fallback = True
+                    elif end_diff is not None and end_diff >= self.asr_fallback_end_diff_sec:
+                        need_fallback = True
+                    if need_fallback:
+                        end_diff_text = f"{end_diff:.1f}s" if end_diff is not None else "n/a"
+                        logging.info(
+                            f"    [ASR] 检测到异常空洞/末尾缺失：max_gap={max_gap:.1f}s, end_diff={end_diff_text}"
+                        )
+
+                if need_fallback:
+                    mix_audio_path = output_dir / f"{video_path.stem}_temp_mix.wav"
+                    temp_files.append(mix_audio_path)
+                    if self.extract_audio(str(video_path), str(mix_audio_path)):
+                        mix_result = self.transcribe(str(mix_audio_path), language=asr_language)
+                        if mix_result and mix_result.get('success'):
+                            mix_stats = self._calc_asr_stats(mix_result.get('segments', []), duration_sec)
+                            if (not result or not result.get('success')) or (
+                                self._asr_quality_score(mix_stats) + 0.01 < self._asr_quality_score(base_stats)
+                            ):
+                                result = mix_result
+                                base_stats = mix_stats
+                                logging.info("    [ASR] 回退到混音（覆盖更完整）")
+                            else:
+                                logging.info("    [ASR] 混音未明显更好，保留人声分离结果")
+                        else:
+                            logging.info("    [ASR] 混音识别失败，保留人声分离结果")
+                    else:
+                        logging.info("    [ASR] 混音提取失败，保留人声分离结果")
 
             # 删除临时音频
             for temp_path in temp_files:
