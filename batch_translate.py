@@ -1645,7 +1645,26 @@ class VideoTranslator:
             seg2['end'] = end
             out.append(seg2)
 
-        return out
+        return self._finalize_subtitle_overlaps(out)
+
+    @staticmethod
+    def _finalize_subtitle_overlaps(segments):
+        if not segments:
+            return []
+        segments.sort(key=lambda s: float(s.get('start', 0.0) or 0.0))
+        for i in range(len(segments) - 1):
+            cur = segments[i]
+            nxt = segments[i + 1]
+            try:
+                cur_start = float(cur.get('start', 0.0) or 0.0)
+                cur_end = float(cur.get('end', cur_start) or cur_start)
+                nxt_start = float(nxt.get('start', cur_end) or cur_end)
+            except Exception:
+                continue
+            if cur_end > nxt_start - 0.01:
+                cur_end = max(cur_start + 0.02, nxt_start - 0.01)
+                cur['end'] = cur_end
+        return segments
 
     @staticmethod
     def _ass_escape(text: str) -> str:
@@ -1847,16 +1866,21 @@ class VideoTranslator:
                 temp_files.append(vocals_path)
                 self.separate_vocals(audio_sep_path, vocals_path)
                 asr_audio_path = vocals_path
+                fallback_mix_path = None
                 if self.vocal_mix_ratio > 0:
                     temp_files.append(vocals_mix_path)
                     if self._mix_vocals_with_original(vocals_path, audio_path, vocals_mix_path, self.vocal_mix_ratio):
-                        asr_audio_path = vocals_mix_path
-                        logging.info(f"    [ASR] 使用人声+混音融合（mix_ratio={self.vocal_mix_ratio:.2f}）")
+                        fallback_mix_path = vocals_mix_path
+                        logging.info(
+                            f"    [ASR] 已准备人声+混音融合（mix_ratio={self.vocal_mix_ratio:.2f}），必要时回退使用"
+                        )
                     else:
-                        logging.info("    [ASR] 融合失败，使用纯人声")
+                        logging.info("    [ASR] 融合准备失败，必要时将回退到原始混音")
+                logging.info(f"    [ASR] 主输入：人声分离（{asr_audio_path.name}）")
                 logging.info(f"  [{step}/{total_steps}] 人声分离完成 ✓")
             else:
                 asr_audio_path = audio_path
+                fallback_mix_path = None
 
             # 3. 语音识别
             step += 1
@@ -1896,24 +1920,41 @@ class VideoTranslator:
                         )
 
                 if need_fallback:
-                    mix_audio_path = output_dir / f"{video_path.stem}_temp_mix.wav"
-                    temp_files.append(mix_audio_path)
-                    if self.extract_audio(str(video_path), str(mix_audio_path)):
-                        mix_result = self.transcribe(str(mix_audio_path), language=asr_language)
-                        if mix_result and mix_result.get('success'):
-                            mix_stats = self._calc_asr_stats(mix_result.get('segments', []), duration_sec)
-                            if (not result or not result.get('success')) or (
-                                self._asr_quality_score(mix_stats) + 0.01 < self._asr_quality_score(base_stats)
-                            ):
-                                result = mix_result
-                                base_stats = mix_stats
-                                logging.info("    [ASR] 回退到混音（覆盖更完整）")
-                            else:
-                                logging.info("    [ASR] 混音未明显更好，保留人声分离结果")
+                    best_result = result
+                    best_stats = base_stats
+                    best_score = self._asr_quality_score(base_stats)
+                    best_label = "人声分离"
+
+                    fallback_candidates = []
+                    if fallback_mix_path and fallback_mix_path.exists():
+                        fallback_candidates.append(("人声+混音融合", fallback_mix_path, False))
+                    mix_audio_path = audio_path if audio_path.exists() else (output_dir / f"{video_path.stem}_temp_mix.wav")
+                    fallback_candidates.append(("原始混音", mix_audio_path, True))
+
+                    for label, path, needs_extract in fallback_candidates:
+                        if needs_extract and not path.exists():
+                            if path != audio_path:
+                                temp_files.append(path)
+                            if not self.extract_audio(str(video_path), str(path)):
+                                logging.info(f"    [ASR] {label} 提取失败，跳过")
+                                continue
+                        cand_result = self.transcribe(str(path), language=asr_language)
+                        if not cand_result or not cand_result.get('success'):
+                            logging.info(f"    [ASR] {label} 识别失败，跳过")
+                            continue
+                        cand_stats = self._calc_asr_stats(cand_result.get('segments', []), duration_sec)
+                        cand_score = self._asr_quality_score(cand_stats)
+                        if (not best_result or not best_result.get('success')) or (cand_score + 0.01 < best_score):
+                            best_result = cand_result
+                            best_stats = cand_stats
+                            best_score = cand_score
+                            best_label = label
+                            logging.info(f"    [ASR] 回退到{label}（覆盖更完整）")
                         else:
-                            logging.info("    [ASR] 混音识别失败，保留人声分离结果")
-                    else:
-                        logging.info("    [ASR] 混音提取失败，保留人声分离结果")
+                            logging.info(f"    [ASR] {label} 未明显更好，继续保留 {best_label}")
+
+                    result = best_result
+                    base_stats = best_stats
 
             # 删除临时音频
             for temp_path in temp_files:
