@@ -4,6 +4,7 @@ import time
 import sys
 import threading
 import traceback
+import shutil
 from contextlib import nullcontext as _nullcontext
 from flask import Flask, request, jsonify
 from werkzeug.exceptions import HTTPException
@@ -250,15 +251,36 @@ def _load_models_async(asr_size: str, translation_name: str, device: str, comput
                         raise ImportError('Transformers ASR not available')
                     _set_status('asr_loading', 0.08, f'Loading ASR model {asr_id} (transformers) ...')
                     dtype = torch.float16 if device == 'cuda' else torch.float32
-                    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                        asr_id,
-                        torch_dtype=dtype,
-                        low_cpu_mem_usage=True,
-                        cache_dir='./models/reazonspeech'
-                    )
+                    cache_dir = os.path.abspath('./models/reazonspeech')
+                    os.makedirs(cache_dir, exist_ok=True)
+
+                    def _load_reazon(force_download: bool = False):
+                        model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                            asr_id,
+                            torch_dtype=dtype,
+                            low_cpu_mem_usage=True,
+                            cache_dir=cache_dir,
+                            force_download=force_download
+                        )
+                        processor = AutoProcessor.from_pretrained(
+                            asr_id,
+                            cache_dir=cache_dir,
+                            force_download=force_download
+                        )
+                        return model, processor
+
+                    try:
+                        model, processor = _load_reazon(False)
+                    except OSError as e:
+                        if getattr(e, 'errno', None) != 2:
+                            raise
+                        # 清理损坏/不完整缓存后重试一次
+                        shutil.rmtree(cache_dir, ignore_errors=True)
+                        os.makedirs(cache_dir, exist_ok=True)
+                        model, processor = _load_reazon(True)
+
                     if device == 'cuda':
                         model = model.to(device)
-                    processor = AutoProcessor.from_pretrained(asr_id, cache_dir='./models/reazonspeech')
                     ASR_MODEL = pipeline(
                         'automatic-speech-recognition',
                         model=model,
