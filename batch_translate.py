@@ -1645,26 +1645,7 @@ class VideoTranslator:
             seg2['end'] = end
             out.append(seg2)
 
-        return self._finalize_subtitle_overlaps(out)
-
-    @staticmethod
-    def _finalize_subtitle_overlaps(segments):
-        if not segments:
-            return []
-        segments.sort(key=lambda s: float(s.get('start', 0.0) or 0.0))
-        for i in range(len(segments) - 1):
-            cur = segments[i]
-            nxt = segments[i + 1]
-            try:
-                cur_start = float(cur.get('start', 0.0) or 0.0)
-                cur_end = float(cur.get('end', cur_start) or cur_start)
-                nxt_start = float(nxt.get('start', cur_end) or cur_end)
-            except Exception:
-                continue
-            if cur_end > nxt_start - 0.01:
-                cur_end = max(cur_start + 0.02, nxt_start - 0.01)
-                cur['end'] = cur_end
-        return segments
+        return out
 
     @staticmethod
     def _ass_escape(text: str) -> str:
